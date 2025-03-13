@@ -99,77 +99,7 @@ def loss_function(t_data, u_data, y_data):
 
     return physics_loss + data_loss, physics_loss, data_loss
 
-if __name__ == '__main__':
-    # Check if GPU is available
-    if(torch.cuda.is_available()):  # Check if GPU is available
-        print(torch.cuda.device_count())  # Number of GPUs
-        print(torch.cuda.get_device_name(0))  # GPU name
-        print(torch.cuda.memory_allocated(0) / 1e6, "MB")  # Memory used
-        print(torch.cuda.memory_reserved(0) / 1e6, "MB")  # Memory reserved
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-        print(f'No GPU available, using the {device} instead.')
-
-    # Define true physical parameters (assumed unknown)
-    m1_true = 1.0       # mass 1
-    m2_true = 1.5       # mass 2
-    k1_true = 2.0       # spring stiffness
-    c1_true = 0.5       # damping coefficient
-
-    Tf = 10 # seconds for the test simulation
-    Ts = 0.01 # seconds for the test simulation
-
-    # Define physical parameters (what is assumed known) or what is learnable
-    if(True):
-        m1 = m1_true       # mass 1
-    else:
-        m1 = nn.Parameter(torch.tensor(2.0, device=device))
-    if(True):
-        m2 = m2_true       # mass 2
-    else:
-        m2 = nn.Parameter(torch.tensor(2.0, device=device))
-    if(False):
-        k1 = k1_true       # spring stiffness
-    else:
-        k1 = nn.Parameter(torch.tensor(1.0, device=device))
-    if(True):
-        c1 = c1_true       # damping coefficient
-    else:
-        c1 = nn.Parameter(torch.tensor(1.5, device=device))
-
-    # learnable parameters list
-    learnable_params = []
-    if(not isinstance(m1, float)):
-        learnable_params.append(m1)
-    if(not isinstance(m2, float)):  
-        learnable_params.append(m2)
-    if(not isinstance(k1, float)):
-        learnable_params.append(k1)
-    if(not isinstance(c1, float)):
-        learnable_params.append(c1)
-    print(f"learnable_params used: {learnable_params}")
-
-    # Define the NN model architecture:
-    # Input: time t and input u, Output: [x1, x1_dot, x2, x2_dot]
-    layers = [2, 50, 100, 100, 50, 4]
-    model = PINN(layers).to(device)
-
-    # Load the model's parameters and the learned physical parameters
-    try:
-        checkpoint = torch.load('pinn_model.pth')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        if checkpoint['m1'] is not None:
-            m1 = checkpoint['m1']
-        if checkpoint['m2'] is not None:
-            m2 = checkpoint['m2']
-        if checkpoint['k1'] is not None:
-            k1 = checkpoint['k1']
-        if checkpoint['c1'] is not None:
-            c1 = checkpoint['c1']
-        print("Model and parameters loaded.")
-    except FileNotFoundError:
-        print("No saved model found. Starting from scratch.")
+def main_single_datapoint():
 
     # Time domain for simulation
     t_sim = np.linspace(0, Tf, int(Tf/Ts))
@@ -272,3 +202,188 @@ if __name__ == '__main__':
     plt.tight_layout()
     plt.show()
 
+def main_multiple_datapoints():
+
+    # Time domain for simulation
+    t_sim = np.linspace(0, Tf, int(Tf/Ts))
+    N_datapoints = 10
+
+    for i in range(N_datapoints):
+        print(f"Training for datapoint {i+1}/{N_datapoints}")
+
+        # Initial conditions: [x1, x1_dot, x2, x2_dot]
+        y0 = (10*np.random.rand(4)).tolist()
+        sol = odeint(two_mass_ode, y0, t_sim, args=(m1_true,  m2_true,  k1_true,  c1_true))
+
+        # Convert simulated data to torch tensors
+        t_full = torch.tensor(t_sim, dtype=torch.float32).view(-1,1).to(device)
+        u_full = torch.tensor(force(t_full).clone().detach(), dtype=torch.float32).view(-1,1).to(device)
+        y_full = torch.tensor(sol,   dtype=torch.float32).to(device)
+
+        # Training parameters
+        Tf_train = 7.0
+        Ts_train = 0.01
+        n_epochs = 5000
+        learning_rate = 1e-5
+
+        # what parameters are learnable
+        optimizer = optim.Adam(list(model.parameters()) + learnable_params, lr=learning_rate)
+
+        # Generate collocation points for enforcing the physics constraint in the domain
+        y_train = y_full[:int(Tf_train/Ts_train), :]
+        u_train = u_full[:int(Tf_train/Ts_train), :]
+        t_train = t_full[:int(Tf_train/Ts_train), :]
+
+        # Training loop history
+        loss_history = []
+        physics_loss_history = []
+        data_loss_history = []
+
+        print("Starting training ...")
+        for epoch in range(n_epochs):
+            optimizer.zero_grad()
+        
+            total_loss, phys_loss, d_loss = loss_function(t_train, u_train, y_train)
+            total_loss.backward()
+            optimizer.step()
+        
+            loss_history.append(total_loss.item())
+            physics_loss_history.append(phys_loss.item())
+            data_loss_history.append(d_loss.item())
+        
+            if epoch % 500 == 0:
+                print(f"Epoch {epoch:04d} | Total Loss: {total_loss.item():.4e} | Physics Loss: {phys_loss.item():.4e} | Data Loss: {d_loss.item():.4e}")
+
+
+        # Print the final learned parameter values
+        if(not isinstance(m1, float)):
+            print(f"Learned parameter: m1 = {m1.item():.4f} (physical value: {m1_true})")
+        if(not isinstance(m2, float)):  
+            print(f"Learned parameter: m2 = {m2.item():.4f} (physical value: {m2_true})")
+        if(not isinstance(k1, float)):
+            print(f"Learned parameter: k1 = {k1.item():.4f} (physical value: {k1_true})")
+        if(not isinstance(c1, float)):
+            print(f"Learned parameter: c1 = {c1.item():.4f} (physical value: {c1_true})")
+
+        # Plot the losses
+        plt.figure(figsize=(8,5))
+        plt.semilogy(loss_history, label='Total Loss')
+        plt.semilogy(physics_loss_history, label='Physics Loss')
+        plt.semilogy(data_loss_history, label='Data Loss')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.title(f"Training Loss History {i}")
+        plt.show(block=False)
+
+        # Plot the predictions versus true simulation:
+        model.eval()
+        with torch.no_grad():
+            y_pred = model(t_full, u_full).cpu().numpy()
+
+        # Save the model's parameters and the learned physical parameters
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'm1': m1 if isinstance(m1, nn.Parameter) else None,
+            'm2': m2 if isinstance(m2, nn.Parameter) else None,
+            'k1': k1 if isinstance(k1, nn.Parameter) else None,
+            'c1': c1 if isinstance(c1, nn.Parameter) else None,
+        }, 'pinn_model.pth')
+        print("Model and parameters saved.")
+    
+        plt.figure(figsize=(10,8))
+        plt.subplot(2,1,1)
+        plt.plot(t_sim, sol[:,0], 'b-', label='x1 True')
+        plt.plot(t_sim, y_pred[:,0], 'r--', label='x1 PINN')
+        plt.xlabel("Time")
+        plt.ylabel("x1")
+        plt.legend()
+
+        plt.subplot(2,1,2)
+        plt.plot(t_sim, sol[:,2], 'b-', label='x2 True')
+        plt.plot(t_sim, y_pred[:,2], 'r--', label='x2 PINN')
+        plt.xlabel("Time")
+        plt.ylabel("x2")
+        plt.legend()
+
+        plt.tight_layout()
+        plt.show(block=False)
+
+    plt.show()
+
+
+
+if __name__ == '__main__':
+    # Check if GPU is available
+    if(torch.cuda.is_available()):  # Check if GPU is available
+        print(torch.cuda.device_count())  # Number of GPUs
+        print(torch.cuda.get_device_name(0))  # GPU name
+        print(torch.cuda.memory_allocated(0) / 1e6, "MB")  # Memory used
+        print(torch.cuda.memory_reserved(0) / 1e6, "MB")  # Memory reserved
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+        print(f'No GPU available, using the {device} instead.')
+
+    # Define the NN model architecture:
+    # Input: time t and input u, Output: [x1, x1_dot, x2, x2_dot]
+    layers = [2, 50, 100, 100, 50, 4]
+    model = PINN(layers).to(device)
+
+    Tf = 10 # seconds for the test simulation
+    Ts = 0.01 # seconds for the test simulation
+
+    # Define true physical parameters (assumed unknown)
+    m1_true = 1.0       # mass 1
+    m2_true = 1.5       # mass 2
+    k1_true = 2.0       # spring stiffness
+    c1_true = 0.5       # damping coefficient
+
+    # Define physical parameters (what is assumed known) or what is learnable
+    if(True):
+        m1 = m1_true       # mass 1
+    else:
+        m1 = nn.Parameter(torch.tensor(2.0, device=device))
+    if(True):
+        m2 = m2_true       # mass 2
+    else:
+        m2 = nn.Parameter(torch.tensor(2.0, device=device))
+    if(False):
+        k1 = k1_true       # spring stiffness
+    else:
+        k1 = nn.Parameter(torch.tensor(1.0, device=device))
+    if(True):
+        c1 = c1_true       # damping coefficient
+    else:
+        c1 = nn.Parameter(torch.tensor(1.5, device=device))
+
+    # Load the model's parameters and the learned physical parameters
+    try:
+        checkpoint = torch.load('pinn_model.pth')
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if checkpoint['m1'] is not None:
+            m1 = checkpoint['m1']
+        if checkpoint['m2'] is not None:
+            m2 = checkpoint['m2']
+        if checkpoint['k1'] is not None:
+            k1 = checkpoint['k1']
+        if checkpoint['c1'] is not None:
+            c1 = checkpoint['c1']
+        print("Model and parameters loaded.")
+    except FileNotFoundError:
+        print("No saved model found. Starting from scratch.")
+
+    # learnable parameters list
+    learnable_params = []
+    if(not isinstance(m1, float)):
+        learnable_params.append(m1)
+    if(not isinstance(m2, float)):  
+        learnable_params.append(m2)
+    if(not isinstance(k1, float)):
+        learnable_params.append(k1)
+    if(not isinstance(c1, float)):
+        learnable_params.append(c1)
+    print(f"learnable_params used: {learnable_params}")
+
+    # main_single_datapoint()
+    main_multiple_datapoints()
