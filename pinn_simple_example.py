@@ -97,7 +97,7 @@ def loss_function(t_data, u_data, y_data):
     y_pred = model(t_data, u_data)
     data_loss = torch.mean((y_pred - y_data)**2)
 
-    return physics_loss + data_loss, physics_loss, data_loss
+    return lambda_phys * physics_loss + data_loss, physics_loss, data_loss
 
 def main_single_datapoint():
 
@@ -123,16 +123,16 @@ def main_single_datapoint():
 
     # Generate collocation points for enforcing the physics constraint in the domain
     # t_colloc = torch.unsqueeze(torch.linspace(0.0, Tf_train, int(Tf_train/Ts_train)), 1).to(device)
-    y_train = y_full[:int(Tf_train/Ts_train), :]
-    u_train = u_full[:int(Tf_train/Ts_train), :]
-    t_train = t_full[:int(Tf_train/Ts_train), :]
+    y_train = y_full[:int(Tf_train/Ts_train):int(Ts_train/Ts), :]
+    u_train = u_full[:int(Tf_train/Ts_train):int(Ts_train/Ts), :]
+    t_train = t_full[:int(Tf_train/Ts_train):int(Ts_train/Ts), :]
 
     # Training loop history
     loss_history = []
     physics_loss_history = []
     data_loss_history = []
 
-    print("Starting training ...")
+    print("Starting training on a single data point ...")
     for epoch in range(n_epochs):
         optimizer.zero_grad()
     
@@ -230,9 +230,9 @@ def main_multiple_datapoints():
         optimizer = optim.Adam(list(model.parameters()) + learnable_params, lr=learning_rate)
 
         # Generate collocation points for enforcing the physics constraint in the domain
-        y_train = y_full[:int(Tf_train/Ts_train), :]
-        u_train = u_full[:int(Tf_train/Ts_train), :]
-        t_train = t_full[:int(Tf_train/Ts_train), :]
+        y_train = y_full[:int(Tf_train/Ts_train):int(Ts_train/Ts), :]
+        u_train = u_full[:int(Tf_train/Ts_train):int(Ts_train/Ts), :]
+        t_train = t_full[:int(Tf_train/Ts_train):int(Ts_train/Ts), :]
 
         # Training loop history
         loss_history = []
@@ -312,6 +312,40 @@ def main_multiple_datapoints():
     plt.show()
 
 
+def inference():
+    # Time domain for simulation
+    t_sim = np.linspace(0, Tf, int(Tf/Ts))
+    # Initial conditions: [x1, x1_dot, x2, x2_dot]
+    y0 = (10*np.random.rand(4)).tolist()
+    y0_tensor = torch.tensor(y0, dtype=torch.float32).view(-1,1).to(device)
+    sol = odeint(two_mass_ode, y0, t_sim, args=(m1_true,  m2_true,  k1_true,  c1_true))
+
+    # Convert simulated data to torch tensors
+    t_full = torch.tensor(t_sim, dtype=torch.float32).view(-1,1).to(device)
+    u_full = torch.tensor(force(t_full).clone().detach(), dtype=torch.float32).view(-1,1).to(device)
+    
+    # Plot the predictions versus true simulation:
+    model.eval()
+    with torch.no_grad():
+        y_pred = model(t_full, u_full, y0_tensor).cpu().numpy()
+
+    plt.figure(figsize=(10,8))
+    plt.subplot(2,1,1)
+    plt.plot(t_sim, sol[:,0], 'b-', label='x1 True')
+    plt.plot(t_sim, y_pred[:,0], 'r--', label='x1 PINN')
+    plt.xlabel("Time")
+    plt.ylabel("x1")
+    plt.legend()
+
+    plt.subplot(2,1,2)
+    plt.plot(t_sim, sol[:,2], 'b-', label='x2 True')
+    plt.plot(t_sim, y_pred[:,2], 'r--', label='x2 PINN')
+    plt.xlabel("Time")
+    plt.ylabel("x2")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == '__main__':
     # Check if GPU is available
@@ -338,6 +372,8 @@ if __name__ == '__main__':
     m2_true = 1.5       # mass 2
     k1_true = 2.0       # spring stiffness
     c1_true = 0.5       # damping coefficient
+
+    lambda_phys = 1.0   # mixing ratio between physics loss to data loss
 
     # Define physical parameters (what is assumed known) or what is learnable
     if(True):
@@ -373,17 +409,31 @@ if __name__ == '__main__':
     except FileNotFoundError:
         print("No saved model found. Starting from scratch.")
 
+
     # learnable parameters list
-    learnable_params = []
+    learnable_params, learnable_params_s = [], []
     if(not isinstance(m1, float)):
         learnable_params.append(m1)
+        learnable_params_s.append("m1")
     if(not isinstance(m2, float)):  
         learnable_params.append(m2)
+        learnable_params_s.append("m2")
     if(not isinstance(k1, float)):
         learnable_params.append(k1)
+        learnable_params_s.append("k1")
     if(not isinstance(c1, float)):
         learnable_params.append(c1)
-    print(f"learnable_params used: {learnable_params}")
+        learnable_params_s.append("c1")
+    print(f"learnable_params used: {learnable_params_s}={learnable_params}")
 
-    # main_single_datapoint()
-    main_multiple_datapoints()
+    # Count the number of learnable parameters in the model
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # Add the number of learnable physical parameters
+    total_params += sum(p.numel() for p in learnable_params)
+
+    print(f"Total number of learnable parameters: {total_params}")
+
+    main_single_datapoint()
+    # main_multiple_datapoints()
+    # inference()
