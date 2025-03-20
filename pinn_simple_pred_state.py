@@ -47,10 +47,13 @@ class PINN(nn.Module):
 
         self.activation = nn.Tanh()
 
-    def forward(self, t, state, force):
+    def forward(self, dt, state, force):
         """Forward pass of the neural network."""
-        # x = torch.cat((t, state, force), dim=1)  # Concatenate (time), state, and force
-        x = torch.cat((state, force), dim=1)  # Concatenate (time), state, and force
+        # state: [batch, 4] current state
+        # force: [batch, 1] control input
+        # dt:    [batch, 1] time step
+        x = torch.cat((dt, state, force), dim=1)  # Concatenate (time), state, and force
+        # x = torch.cat((state, force), dim=1)  # Concatenate (time), state, and force
         for linear in self.linears:
             x = self.activation(linear(x))
         return self.output_layer(x)
@@ -67,13 +70,16 @@ class PINN(nn.Module):
         # Compute derivatives using finite differentiation
         a1_t = (v1_pred - v1) / dt
         a2_t = (v2_pred - v2) / dt
+        v1_t = (x1_pred - x1) / dt
+        v2_t = (x2_pred - x2) / dt
 
         # Formulate the residual equations
         residual_1 = self.system.m1 * a1_t - (force - self.system.k1 * x1 - self.system.b1 * v1 + self.system.k2 * (x2 - x1) + self.system.b2 * (v2 - v1))
         residual_2 = self.system.m2 * a2_t - (-self.system.k2 * (x2 - x1) - self.system.b2 * (v2 - v1))
-
+        residual_3 = v1_t - v1
+        residual_4 = v2_t - v2
         # Physics loss is the mean squared error of the residuals
-        loss = torch.mean(residual_1**2) + torch.mean(residual_2**2)
+        loss = torch.mean(residual_1**2) + torch.mean(residual_2**2) + torch.mean(residual_3**2) + torch.mean(residual_4**2)
         return loss
 
     def data_loss(self, t, state, force, state_target, state_pred):
@@ -92,7 +98,7 @@ def train_pinn(pinn, optimizer, t_data, state_data, force_data, state_target_dat
         optimizer.zero_grad()
 
         # Predict the state using the PINN
-        state_pred = pinn.forward(t_data, state_data, force_data)  # Pass state and force
+        state_pred = pinn.forward(dt, state_data, force_data)  # Pass state and force
 
         data_loss = pinn.data_loss(t_data, state_data, force_data, state_target_data, state_pred)
         physics_loss = pinn.physics_loss(t_data, state_data, force_data, state_pred, dt)
@@ -121,6 +127,8 @@ def inference(system, plot_history=False):
     t_test_np = np.linspace(t_span[0], t_span[0] + 5, num_steps + 1)  # Extrapolate 5 seconds
     t_extrap_span = (t_span[0], t_span[0] + 5)
     t_extrap_eval = t_test_np[1:]
+    dt_value = t_test_np[1] - t_test_np[0]
+
     extrap_solution = system.simulate(t_extrap_span, initial_state_test.numpy().flatten(), t_extrap_eval, F_ext_func)
     x1_true_np = extrap_solution[:, 0]
     v1_true_np = extrap_solution[:, 1]
@@ -132,9 +140,10 @@ def inference(system, plot_history=False):
         current_state = initial_state_test
         for i in range(num_steps):
             time_value = torch.tensor(t_test_np[i], dtype=torch.float32).reshape(1, -1).requires_grad_(True)
+            dt = torch.tensor(dt_value, dtype=torch.float32).reshape(1,-1)
             force_value = torch.tensor(F_ext_func(t_test_np[i]), dtype=torch.float32).reshape(1, -1)
 
-            next_state_predicted = pinn(time_value, current_state, force_value)
+            next_state_predicted = pinn(dt, current_state, force_value)
             predicted_trajectory.append(next_state_predicted.numpy().flatten())
             current_state = next_state_predicted
 
@@ -242,10 +251,11 @@ if __name__ == "__main__":
     # Simulation parameters
     t_span = (0, 10)
     t_eval = np.linspace(t_span[0], t_span[1], 1000, endpoint=True)
-    dt = t_eval[1] - t_eval[0]
-    plot_history  = False
+    dt = torch.tensor( t_eval[1] - t_eval[0], dtype=torch.float32).reshape(1,-1)
+    
+    plot_history  = True
 
-    for i in range(100):
+    for i in range(10):
         print(f"Training datapoint iteration {i+1}")
         # initial_state = [0.5, 0.0, -0.2, 0.0]
         initial_state = list(10 * np.random.rand(4))  # Random initial state
@@ -260,6 +270,7 @@ if __name__ == "__main__":
         # Create state vectors [x1, v1, x2, v2]
         # state_data_np = np.stack([x1_data_np, v1_data_np, x2_data_np, v2_data_np], axis=1)
         state_data_np = np.stack([x1_data_np[:-1], v1_data_np[:-1], x2_data_np[:-1], v2_data_np[:-1]], axis=1) # Current state
+        state_next_data_np = np.stack([x1_data_np[1:], v1_data_np[1:], x2_data_np[1:], v2_data_np[1:]], axis=1) # Next state
 
         # Create force data (external force at each time step)
         force_data_np = np.array([F_ext_func(t) for t in t_eval[:-1]]).reshape(-1, 1)
@@ -267,21 +278,22 @@ if __name__ == "__main__":
         # Convert data to torch tensors
         t_data = torch.tensor(t_eval[:-1], dtype=torch.float32).reshape(-1, 1)
         t_data.requires_grad_(True)  # Enable calculating gradients with respect to time
+        # create a dt vector in the size of t_eval
+        dt = dt*torch.ones_like(t_data)
         state_data = torch.tensor(state_data_np, dtype=torch.float32)
+        state_target_data = torch.tensor(state_next_data_np, dtype=torch.float32)
         force_data = torch.tensor(force_data_np, dtype=torch.float32)
         # state_target_data = state_data.clone().detach()  # Train to predict the *same* state
-        state_next_data_np = np.stack([x1_data_np[1:], v1_data_np[1:], x2_data_np[1:], v2_data_np[1:]], axis=1) # Next state
-        state_target_data = torch.tensor(state_next_data_np, dtype=torch.float32)
 
         # PINN parameters
-        input_dim = 5 # 6  # Input: (time), state (x1, v1, x2, v2), force
+        input_dim = 6 # 6  # Input: (time), state (x1, v1, x2, v2), force
         output_dim = 4  # Output: state (x1, v1, x2, v2)
         hidden_dim = 100 # 64
         num_layers = 5
         learning_rate = 0.0001
-        epochs = 2000
+        epochs = 10000
         data_loss_weight = 1.0
-        physics_loss_weight = 1.0
+        physics_loss_weight = .2
 
         # Create the PINN model
         pinn = PINN(input_dim, output_dim, hidden_dim, num_layers, system).to(device)
