@@ -88,7 +88,7 @@ def sindy_library(x, poly_order=2, include_sine=False):
 
 
 # 5. Loss Functions - Modified to use the NN's internal Xi
-def compute_losses(net, t_data, x_data, t_collocation, poly_order = 2, include_sine = False, w_sparse = 0.001):  #Removed Xi from arguments
+def compute_losses(net, t_data, x_data, t_collocation, poly_order = 2, include_sine = False):  #Removed Xi from arguments
     """Computes the data fidelity, SINDy residual, and sparsity losses."""
 
     x_nn = net(t_data)  # PINN prediction at data points
@@ -100,11 +100,12 @@ def compute_losses(net, t_data, x_data, t_collocation, poly_order = 2, include_s
                                     create_graph=True, retain_graph=True)[0]
 
     theta = sindy_library(x_nn_collocation, poly_order, include_sine)
+    # Compute the physical (SINDy) residual
     L_sindy_res = torch.mean((dx_nn_dt - theta @ net.Xi)**2) # Uses net.Xi
 
-    #L_sparsity = torch.sum(torch.abs(net.Xi))  #L1 regularization
+    # L_sparsity = torch.sum(torch.abs(net.Xi))  #L1 regularization
     # Use a smooth L1 approximation (Huber loss) for better gradient behavior
-    L_sparsity = torch.sum(nn.functional.huber_loss(net.Xi, torch.zeros_like(net.Xi), reduction='sum', delta=1.0)) * w_sparse
+    L_sparsity = torch.sum(nn.functional.huber_loss(net.Xi, torch.zeros_like(net.Xi), reduction='sum', delta=1.0))
 
 
     return L_data, L_sindy_res, L_sparsity
@@ -117,8 +118,8 @@ def train(net, t_data, x_data, t_collocation, optimizer, num_epochs,
     net.train()
     for epoch in range(num_epochs):
         optimizer.zero_grad()
-        L_data, L_sindy_res, L_sparsity = compute_losses(net, t_data, x_data, t_collocation, poly_order, include_sine, w_sparse)
-        L_total = w_data * L_data + w_res * L_sindy_res + L_sparsity
+        L_data, L_sindy_res, L_sparsity = compute_losses(net, t_data, x_data, t_collocation, poly_order, include_sine)
+        L_total = w_data * L_data + w_res * L_sindy_res + w_sparse * L_sparsity
         L_total.backward()
         optimizer.step()
 
@@ -134,8 +135,9 @@ if __name__ == '__main__':
     k1, k2 = 1.0, 1.0
     b1, b2 = 0.1, 0.1
     initial_state = [1.0, 0.0, 0.5, 0.0]  # [x1, x1_dot, x2, x2_dot]
-    t_span = [0, 20]
-    t_eval = np.linspace(t_span[0], t_span[1], 200)  # Data points
+    t_span = [0, 10]
+    t_coll = [0, 7]  # Collocation points for physics loss
+    t_eval = np.linspace(t_span[0], t_span[1], 1000)  # Data points
     noise_std = 0.01
 
     # Generate Data - Unchanged
@@ -146,15 +148,15 @@ if __name__ == '__main__':
     x_data = torch.tensor(x_data, dtype=torch.float32)
 
     # Collocation Points (for physics loss) - Unchanged
-    t_collocation = torch.linspace(t_span[0], t_span[1], 200, requires_grad=True).reshape(-1, 1)
+    t_collocation = torch.linspace(t_coll[0], t_coll[1], 700, requires_grad=True).reshape(-1, 1)
 
     # PINN Parameters - Unchanged
     input_dim = 1  # Time
     output_dim = 4  # [x1, x1_dot, x2, x2_dot]
     hidden_dim = 32
     num_layers = 4
-    learning_rate = 1e-3
-    num_epochs = 1000 #Increased Epochs
+    learning_rate = 1e-4
+    num_epochs = 10000 # Training epochs
 
     # SINDy Parameters - Unchanged
     poly_order = 2 #Order of polynomial functions for SINDy library
@@ -163,7 +165,7 @@ if __name__ == '__main__':
     # Loss Weights
     w_data = 1.0
     w_res = 0.1 #Physics loss weight
-    w_sparse = 0.001  #Sparsity weight
+    w_sparse = 0.1  #Sparsity weight
 
     # Initialize PINN and Optimizer - Modified to pass num_functions to PINN
     num_functions = sindy_library(x_data, poly_order, include_sine).shape[1]  # Determine size of library
@@ -185,8 +187,8 @@ if __name__ == '__main__':
     titles = ["x1", "x1_dot", "x2", "x2_dot"]
 
     for i in range(4):
-        axs[i].plot(t_data.numpy(), x_data[:, i].numpy(), 'o', label='Data', alpha=0.5)
-        axs[i].plot(t_test.numpy(), x_pred[:, i], label='PINN Prediction')
+        axs[i].plot(t_data.detach().numpy(), x_data[:, i].numpy(), 'o', label='Data', alpha=0.5)
+        axs[i].plot(t_test.detach().numpy(), x_pred[:, i], label='PINN Prediction')
         axs[i].set_xlabel('Time')
         axs[i].set_ylabel(titles[i])
         axs[i].legend()
@@ -200,12 +202,15 @@ if __name__ == '__main__':
     feature_names = ["1"]
     feature_names.extend([f"x{i+1}" for i in range(4)])
     feature_names.extend([f"x{i+1}^2" for i in range(4)])
+    for i in range(4):
+        for j in range(i + 1, 4):
+            feature_names.append(f"x{i+1} * x{j+1}")
 
     equations = []
     for i in range(4):  # For each state variable (x1_dot, x1_ddot, x2_dot, x2_ddot)
       equation = ""
       for j in range(num_functions):  # Iterate through each term in the library
-        if abs(net.Xi[j, i]) > 1e-3:  # Only print terms with significant coefficients
+        if abs(net.Xi[j, i]) > 5e-3:  # Only print terms with significant coefficients
           equation += f"{net.Xi[j, i]:.2f} * {feature_names[j]} + "
       equation = equation[:-3] #Remove last " + "
       equations.append(equation)
