@@ -25,7 +25,7 @@ def generate_data(m1, m2, k1, k2, b1, b2, initial_state, t_span, t_eval, noise_s
     """Generates training data by solving the ODE and adding noise."""
     sol = solve_ivp(double_mass_spring_damper, t_span, initial_state, t_eval=t_eval,
                     args=(m1, m2, k1, k2, b1, b2), rtol=1e-8, atol=1e-8)
-    x_data = sol.y.T + np.random.normal(0, noise_std, sol.y.T.shape)  # Add noise
+    x_data = sol.y.T + np.random.normal(0, noise_std, sol.y.T.shape)  # Add measurement noise
     t_data = sol.t
     return t_data, x_data
 
@@ -108,13 +108,13 @@ def compute_losses(net, t_data, x_data, t_collocation, Xi, poly_order = 2, inclu
 
 # 6. Optimization Loops (Alternating)
 def train_pinn(net, t_data, x_data, t_collocation, Xi, optimizer, num_epochs,
-               w_data, w_res, poly_order = 2, include_sine = False):
+               w_data, w_res, w_sparse, poly_order = 2, include_sine = False):
     """Trains the PINN with a fixed SINDy coefficient matrix Xi."""
     net.train()  # Set network to training mode
     for epoch in range(num_epochs):
         optimizer.zero_grad()
-        L_data, L_sindy_res, _ = compute_losses(net, t_data, x_data, t_collocation, Xi, poly_order, include_sine)
-        L_total = w_data * L_data + w_res * L_sindy_res
+        L_data, L_sindy_res, L_sparsity = compute_losses(net, t_data, x_data, t_collocation, Xi, poly_order, include_sine)
+        L_total = w_data * L_data + w_res * L_sindy_res + w_sparse * L_sparsity
         L_total.backward()
         optimizer.step()
 
@@ -126,21 +126,35 @@ def train_pinn(net, t_data, x_data, t_collocation, Xi, optimizer, num_epochs,
 def update_sindy_coefficients(net, t_collocation, poly_order = 2, include_sine = False, threshold = 0.1):
     """Updates the SINDy coefficient matrix Xi using sparse regression (LASSO)."""
     net.eval()  # Set network to evaluation mode
-    with torch.no_grad():
-        x_nn_collocation = net(t_collocation) #PINN predictions at collocation points
-        dx_nn_dt = torch.autograd.grad(x_nn_collocation, t_collocation,
-                                        grad_outputs=torch.ones_like(x_nn_collocation),
-                                        create_graph=False, retain_graph=False)[0] #Gradient computation is slow. Disable graph tracking when not needed
 
-        theta = sindy_library(x_nn_collocation, poly_order, include_sine)
-        # Perform sparse regression using scikit-learn's Lasso
-        lasso = Lasso(alpha=threshold, fit_intercept=False, max_iter=5000, tol=1e-6, random_state = 0)
-        Xi = np.zeros((theta.shape[1], 4)) # 4 = state_dim = [x1, x1_dot, x2, x2_dot]
-        for i in range(4):
-            lasso.fit(theta.numpy(), dx_nn_dt[:,i].numpy())
-            Xi[:, i] = lasso.coef_
+    # Compute x_nn_collocation with gradients enabled
+    t_collocation = t_collocation.clone().detach().requires_grad_(True)  # Ensure t_collocation requires gradients
+    x_nn_collocation = net(t_collocation)  # PINN predictions at collocation points
 
-        Xi = torch.tensor(Xi, dtype=torch.float32)
+    # Compute the time derivative dx_nn_dt for each output dimension
+    dx_nn_dt = []
+    for i in range(x_nn_collocation.shape[1]):  # Loop over output dimensions (4)
+        grad = torch.autograd.grad(
+            x_nn_collocation[:, i], t_collocation,
+            grad_outputs=torch.ones_like(x_nn_collocation[:, i]),
+            create_graph=False, retain_graph=True
+        )[0]
+        dx_nn_dt.append(grad)
+
+    # Stack gradients to form a tensor of shape (700, 4)
+    dx_nn_dt = torch.cat(dx_nn_dt, dim=1)
+    theta = sindy_library(x_nn_collocation.clone().detach(), poly_order, include_sine)
+
+    # Perform sparse regression using scikit-learn's Lasso
+    lasso = Lasso(alpha=threshold, fit_intercept=False, max_iter=5000, tol=1e-6, random_state=0)
+    Xi = np.zeros((theta.shape[1], 4))  # 4 = state_dim = [x1, x1_dot, x2, x2_dot]
+    for i in range(4):
+        lasso.fit(theta.numpy(), dx_nn_dt[:, i].numpy())
+        Xi[:, i] = lasso.coef_
+
+    # Convert Xi back to a PyTorch tensor
+    Xi = torch.tensor(Xi, dtype=torch.float32)
+
     return Xi
 
 # 7. Main Training Loop & Visualization
@@ -150,8 +164,9 @@ if __name__ == '__main__':
     k1, k2 = 1.0, 1.0
     b1, b2 = 0.1, 0.1
     initial_state = [1.0, 0.0, 0.5, 0.0]  # [x1, x1_dot, x2, x2_dot]
-    t_span = [0, 20]
-    t_eval = np.linspace(t_span[0], t_span[1], 200)  # Data points
+    t_span = [0, 10]
+    t_coll = [0, 7 ]
+    t_eval = np.linspace(t_span[0], t_span[1], 1000)  # Data points
     noise_std = 0.01
 
     # Generate Data
@@ -162,7 +177,8 @@ if __name__ == '__main__':
     x_data = torch.tensor(x_data, dtype=torch.float32)
 
     # Collocation Points (for physics loss)
-    t_collocation = torch.linspace(t_span[0], t_span[1], 200, requires_grad=True).reshape(-1, 1)
+    t_collocation = torch.linspace(t_coll[0], t_coll[1], 700, requires_grad=True).reshape(-1, 1)
+    t_collocation = t_collocation.clone().detach().requires_grad_(True)
 
     # PINN Parameters
     input_dim = 1  # Time
@@ -170,7 +186,7 @@ if __name__ == '__main__':
     hidden_dim = 32
     num_layers = 4
     learning_rate = 1e-3
-    num_epochs_pinn = 200 # Epochs for PINN training within each alternating loop
+    num_epochs_pinn = 2000 # Epochs for PINN training within each alternating loop
 
     # SINDy Parameters
     poly_order = 2 #Order of polynomial functions for SINDy library
@@ -180,7 +196,7 @@ if __name__ == '__main__':
     # Loss Weights
     w_data = 1.0
     w_res = 0.1 #Physics loss weight
-    w_sparse = 0.001 #Sparsity weight.  (This is not used in this version but keep it in the compute losses). Lasso takes care of this.
+    w_sparse = 0.000 #Sparsity weight.  (This is not used in this version but keep it in the compute losses). Lasso takes care of this.
 
     # Initialize PINN and Optimizer
     net = PINN(input_dim, output_dim, hidden_dim, num_layers)
@@ -197,7 +213,7 @@ if __name__ == '__main__':
 
         # 1. Train PINN (with fixed SINDy coefficients)
         train_pinn(net, t_data, x_data, t_collocation, Xi, optimizer, num_epochs_pinn,
-                   w_data, w_res, poly_order, include_sine)
+                   w_data, w_res, w_sparse, poly_order, include_sine)
 
         # 2. Update SINDy Coefficients (with fixed PINN)
         Xi = update_sindy_coefficients(net, t_collocation, poly_order, include_sine, threshold)
@@ -214,7 +230,7 @@ if __name__ == '__main__':
     titles = ["x1", "x1_dot", "x2", "x2_dot"]
 
     for i in range(4):
-        axs[i].plot(t_data.numpy(), x_data[:, i].numpy(), 'o', label='Data', alpha=0.5)
+        axs[i].plot(t_data.detach().numpy(), x_data[:, i].numpy(), 'o', label='Data', alpha=0.5)
         axs[i].plot(t_test.numpy(), x_pred[:, i], label='PINN Prediction')
         axs[i].set_xlabel('Time')
         axs[i].set_ylabel(titles[i])
@@ -229,6 +245,9 @@ if __name__ == '__main__':
     feature_names = ["1"]
     feature_names.extend([f"x{i+1}" for i in range(4)])
     feature_names.extend([f"x{i+1}^2" for i in range(4)])
+    for i in range(4):
+        for j in range(i + 1, 4):
+            feature_names.append(f"x{i+1} * x{j+1}")
 
     equations = []
     for i in range(4):  # For each state variable (x1_dot, x1_ddot, x2_dot, x2_ddot)
