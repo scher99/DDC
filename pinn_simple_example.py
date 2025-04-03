@@ -115,7 +115,7 @@ def main_single_datapoint():
     # Training parameters
     Tf_train = 7.0
     Ts_train = 0.01
-    n_epochs = 10000 #70000
+    n_epochs = 50000 #70000
     learning_rate = 1e-5
 
     # what parameters are learnable
