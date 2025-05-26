@@ -52,7 +52,11 @@ class PINN(nn.Module):
         # state: [batch, 4] current state
         # force: [batch, 1] control input
         # dt:    [batch, 1] time step
-        x = torch.cat((dt, state, force), dim=1)  # Concatenate (time), state, and force
+        device = next(self.parameters()).device  # Get model's device
+        dt = dt.to(device)
+        state = state.to(device)
+        force = force.to(device)
+        x = torch.cat((dt, state, force), dim=1)
         # x = torch.cat((state, force), dim=1)  # Concatenate (time), state, and force
         for linear in self.linears:
             x = self.activation(linear(x))
@@ -60,6 +64,10 @@ class PINN(nn.Module):
 
     def physics_loss(self, t, state, force, state_pred, dt):
         """Calculates the physics-informed loss using the governing equations and auto-differentiation."""
+        state  = state.to(state_pred.device)  # Ensure state is on the same device
+        dt = dt.to(state_pred.device)  # Ensure dt is on the same device
+        force = force.to(state_pred.device)
+
         x1, v1, x2, v2 = torch.split(state, 1, dim=1)
 
         x1_pred, v1_pred, x2_pred, v2_pred = torch.split(state_pred, 1, dim=1)
@@ -83,6 +91,7 @@ class PINN(nn.Module):
         return loss
 
     def data_loss(self, t, state, force, state_target, state_pred):
+        state_target = state_target.to(state_pred.device)  # Ensure target is on the same device
         """Calculates the data loss based on the difference between predicted and observed data."""
         loss = torch.mean((state_pred - state_target)**2)
         return loss
@@ -144,7 +153,7 @@ def inference(system, plot_history=False):
             force_value = torch.tensor(F_ext_func(t_test_np[i]), dtype=torch.float32).reshape(1, -1)
 
             next_state_predicted = pinn(dt, current_state, force_value)
-            predicted_trajectory.append(next_state_predicted.numpy().flatten())
+            predicted_trajectory.append(next_state_predicted.cpu().numpy().flatten())
             current_state = next_state_predicted
 
     predicted_trajectory = np.array(predicted_trajectory)
@@ -255,7 +264,7 @@ if __name__ == "__main__":
     
     plot_history  = True
 
-    for i in range(10):
+    for i in range(2):
         print(f"Training datapoint iteration {i+1}")
         # initial_state = [0.5, 0.0, -0.2, 0.0]
         initial_state = list(10 * np.random.rand(4))  # Random initial state
