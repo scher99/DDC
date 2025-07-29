@@ -6,7 +6,7 @@ from scipy.optimize import minimize
 
 # --- 1. Define the "Hidden" Plant: Two-Mass Spring-Damper System ---
 
-# System parameters
+# Global system parameters
 m1 = 2.0  # kg
 m2 = 1.0  # kg
 k1 = 1.0  # N/m
@@ -15,7 +15,8 @@ c1 = 0.8  # Ns/m
 c2 = 0.6  # Ns/m
 mu = 0.1  # Friction coefficient
 
-def two_mass_spring_damper(state, t, F):
+# plant = two_mass_spring_damper. this is hidden, we use it only to generate data
+def plant(state, t, F):
     """
     Defines the differential equations for the two-mass spring-damper system.
     state = [x1, x1_dot, x2, x2_dot]
@@ -108,177 +109,226 @@ class LeadLagController:
         self.previous_u = u
         return u
 
-# --- 3. Run the "One-Shot" Simulation ---
 
-# Simulation parameters
-dt = 0.01  # Time step
-T = 10    # Total simulation time
-n_steps = int(T / dt)
-t = np.linspace(0, T, n_steps + 1)
-
-# Reference command
-r = np.ones(n_steps + 1) * 1.0  # Step command to x2 = 1
-
-# Initial PID gains (stable but poor performance)
-Kp_init = 1.0
-Ki_init = 0.5
-Kd_init = 1.0
-# initial_controller = PIDController(Kp_init, Ki_init, Kd_init, dt)
-Tf_init = 0.05 # A small but non-zero filter time constant
-initial_controller = PIDControllerWithFilter(Kp_init, Ki_init, Kd_init, Tf_init, dt)
-
-# Measurement noise characteristics
-noise_std_dev = 0.03
-
-# Initialize state and history arrays
-# state = [x1, x1_dot, x2, x2_dot]
-state = np.array([0.0, 0.0, 0.0, 0.0])
-history_x2 = np.zeros(n_steps + 1)
-history_u = np.zeros(n_steps + 1)
-measured_x2_history = np.zeros(n_steps + 1)
-
-# Main simulation loop
-for i in range(n_steps):
-    # Get the "measured" output (with noise)
-    measured_x2 = state[2] + np.random.normal(0, noise_std_dev)
-    measured_x2_history[i] = measured_x2
-    history_x2[i] = state[2]
-
-    # Calculate controller output
-    error = r[i] - measured_x2
-    u = initial_controller.calculate(error)
-    history_u[i] = u
-
-    # Update plant state using simple Euler integration for one step
-    # Note: For more accuracy, a more sophisticated solver like RK45
-    # from scipy.integrate would be better, but Euler is sufficient here.
-    state_dot = two_mass_spring_damper(state, t[i], u)
-    state = state + np.array(state_dot) * dt
-
-# Store the final state
-history_x2[-1] = state[2]
-measured_x2_history[-1] = state[2] + np.random.normal(0, noise_std_dev)
-history_u[-1] = history_u[-2] # Hold last control value
-
-# This is our collected "one-shot" data
-oneshot_r = r
-oneshot_y = measured_x2_history # The noisy measurement is what the controller sees
-oneshot_u = history_u
-
-# --- 4. Define and Generate the Desired Response ---
-
-# Desired model parameters (as specified)
-zeta = 0.7       # Damping ratio
-omega_n = 2.0    # Natural frequency (rad/s)
-
-# Create the second-order transfer function model: G(s) = omega_n^2 / (s^2 + 2*zeta*omega_n*s + omega_n^2)
-numerator = [omega_n**2]
-denominator = [1, 2*zeta*omega_n, omega_n**2]
-reference_model = signal.TransferFunction(numerator, denominator)
-
-# Simulate the reference model's response to the step input `r`
-# The output is the desired trajectory y_d(t)
-_, y_d, _ = signal.lsim((reference_model.num, reference_model.den), U=oneshot_r, T=t)
+def desired_response(t, oneshot_r, zeta=0.7, omega_n=2.0):
+    """
+    Generates the desired response of a second-order system.
+    zeta: Damping ratio
+    omega_n: Natural frequency (rad/s)
+    """
+    # Second-order system transfer function: G(s) = omega_n^2 / (s^2 + 2*zeta*omega_n*s + omega_n^2)
+    num = [omega_n**2]
+    den = [1, 2*zeta*omega_n, omega_n**2]
+    reference_model = signal.TransferFunction(num, den)
+    
+    # Generate step response
+    _, y_d, _ = signal.lsim((reference_model.num, reference_model.den), U=oneshot_r, T=t)
+    return y_d
 
 
 # --- 5. Plot the Results ---
+def plot_results(t, oneshot_y, oneshot_u, oneshot_r, y_d, zeta=0.7, omega_n=2.0):
+    """
+    Plots the results of the simulation.
+    """
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-plt.style.use('seaborn-v0_8-whitegrid')
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    # Plot 1: Position of Mass 2
+    ax1.plot(t, oneshot_y, label='Measured Position of Mass 2 (x2)')
+    ax1.plot(t, y_d, 'r--', label=f'Desired Response (y_d)\nζ={zeta}, ωn={omega_n} rad/s', linewidth=2.5)
+    ax1.plot(t, oneshot_r, 'k--', label='Reference')
+    ax1.set_ylabel('Position (m)')
+    ax1.set_title('Initial Controller Performance')
+    ax1.legend()
+    ax1.grid(True)
 
-# Plot 1: Position of Mass 2
-ax1.plot(t, oneshot_y, label='Measured Position of Mass 2 (x2)')
-ax1.plot(t, y_d, 'r--', label=f'Desired Response (y_d)\nζ={zeta}, ωn={omega_n} rad/s', linewidth=2.5)
-ax1.plot(t, oneshot_r, 'k--', label='Reference')
-ax1.set_ylabel('Position (m)')
-ax1.set_title('Initial Controller Performance')
-ax1.legend()
-ax1.grid(True)
+    # Plot 2: Control Input
+    ax2.plot(t, oneshot_u, label='Control Input (Force on Mass 1)')
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Force (N)')
+    ax2.legend()
+    ax2.grid(True)
 
-# Plot 2: Control Input
-ax2.plot(t, oneshot_u, label='Control Input (Force on Mass 1)')
-ax2.set_xlabel('Time (s)')
-ax2.set_ylabel('Force (N)')
-ax2.legend()
-ax2.grid(True)
+    plt.tight_layout()
+    plt.show()
 
-plt.tight_layout()
-plt.show()
-
-# Print the shapes of our collected data to confirm
-print(f"Shape of reference data (r): {oneshot_r.shape}")
-print(f"Shape of measured output data (y): {oneshot_y.shape}")
-print(f"Shape of control input data (u): {oneshot_u.shape}")
-print(f"Shape of desired output data (y_d): {y_d.shape}")
+    # Print the shapes of our collected data to confirm
+    # print(f"Shape of reference data (r): {oneshot_r.shape}")
+    # print(f"Shape of measured output data (y): {oneshot_y.shape}")
+    # print(f"Shape of control input data (u): {oneshot_u.shape}")
+    # print(f"Shape of desired output data (y_d): {y_d.shape}")
 
 # --- 6. Calculate the Fictitious Reference ---
+# def calculate_fictitious_reference_pid(oneshot_u, y_d, dt, params):
+#     """
+#     Calculates the fictitious reference signal based on the control input and desired output.
+#     This is used for the FRIT optimization.
+#     """
+#     # # First, define the discrete transfer function for the initial PID controller C0(z)
+#     # # C0(z) = [b0 + b1*z^-1 + b2*z^-2] / [a0 + a1*z^-1 + a2*z^-2]
+#     # # For a standard PID, this is:
+#     # # C0(z) = Kp + Ki*dt/(1-z^-1) + (Kd/dt)*(1-z^-1)
+#     # # After combining terms over a common denominator:
+#     # # Denominator of C0(z) is (1 - z^-1)
+#     # a_C0 = [1, -1]
+#     # # Numerator of C0(z) is (Kp+Ki*dt+Kd/dt) + (-Kp-2*Kd/dt)*z^-1 + (Kd/dt)*z^-2
+#     # b_C0 = [Kp_init + Ki_init*dt + Kd_init/dt,
+#     #         -Kp_init - 2*Kd_init/dt,
+#     #         Kd_init/dt]
 
-# # First, define the discrete transfer function for the initial PID controller C0(z)
-# # C0(z) = [b0 + b1*z^-1 + b2*z^-2] / [a0 + a1*z^-1 + a2*z^-2]
-# # For a standard PID, this is:
-# # C0(z) = Kp + Ki*dt/(1-z^-1) + (Kd/dt)*(1-z^-1)
-# # After combining terms over a common denominator:
-# # Denominator of C0(z) is (1 - z^-1)
-# a_C0 = [1, -1]
-# # Numerator of C0(z) is (Kp+Ki*dt+Kd/dt) + (-Kp-2*Kd/dt)*z^-1 + (Kd/dt)*z^-2
-# b_C0 = [Kp_init + Ki_init*dt + Kd_init/dt,
-#         -Kp_init - 2*Kd_init/dt,
-#         Kd_init/dt]
+#     # # We need the inverse, 1/C0(z), which has its numerator and denominator swapped.
+#     # # So we will filter `oneshot_u` with a system where b = a_C0 and a = b_C0.
+#     # b_inv = a_C0
+#     # a_inv = b_C0
 
-# # We need the inverse, 1/C0(z), which has its numerator and denominator swapped.
-# # So we will filter `oneshot_u` with a system where b = a_C0 and a = b_C0.
-# b_inv = a_C0
-# a_inv = b_C0
+#     # The transfer function of the filtered PID is more complex. Using Tustin's method for discretization:
+#     # C(z) = Kp + Ki*dt/2 * (1+z^-1)/(1-z^-1) + Kd/Tf * (1-z^-1)/((1+dt/2/Tf) - (1-dt/2/Tf)z^-1)
+#     # This results in a 2nd order numerator and denominator (biproper).
+#     # After much algebra, the coefficients are:
+#     Kp_init, Ki_init, Kd_init, Tf_init = params
 
-# The transfer function of the filtered PID is more complex. Using Tustin's method for discretization:
-# C(z) = Kp + Ki*dt/2 * (1+z^-1)/(1-z^-1) + Kd/Tf * (1-z^-1)/((1+dt/2/Tf) - (1-dt/2/Tf)z^-1)
-# This results in a 2nd order numerator and denominator (biproper).
-# After much algebra, the coefficients are:
-k_d_f = Kd_init / (Tf_init + dt)
-k_i_f = Ki_init * dt
+#     k_d_f = Kd_init / (Tf_init + dt)
+#     k_i_f = Ki_init * dt
 
-# Numerator b0, b1, b2
-b0 = Kp_init + k_i_f + k_d_f
-b1 = k_i_f - Kp_init - 2 * k_d_f
-b2 = k_d_f
-b_C0 = [b0, b1, b2]
+#     # Numerator b0, b1, b2
+#     b0 = Kp_init + k_i_f + k_d_f
+#     b1 = k_i_f - Kp_init - 2 * k_d_f
+#     b2 = k_d_f
+#     b_C0 = [b0, b1, b2]
 
-# Denominator a0, a1, a2
-a0 = 1
-a1 = k_i_f * Tf_init / (Tf_init + dt) - 1
-a2 = -k_i_f * Tf_init / (Tf_init + dt)
-a_C0 = [a0, a1, a2]
+#     # Denominator a0, a1, a2
+#     a0 = 1
+#     a1 = k_i_f * Tf_init / (Tf_init + dt) - 1
+#     a2 = -k_i_f * Tf_init / (Tf_init + dt)
+#     a_C0 = [a0, a1, a2]
 
-# The inverse controller 1/C0(z) simply swaps the coefficients.
-# Because C0(z) is now biproper, its inverse is also biproper and computable.
-b_inv = a_C0
-a_inv = b_C0
+#     # The inverse controller 1/C0(z) simply swaps the coefficients.
+#     # Because C0(z) is now biproper, its inverse is also biproper and computable.
+#     b_inv = a_C0
+#     a_inv = b_C0
 
-# Calculate the fictitious error `e_f` by filtering `u` with the inverse controller dynamics
-e_f = signal.lfilter(b_inv, a_inv, oneshot_u)
+#     # Calculate the fictitious error `e_f` by filtering `u` with the inverse controller dynamics
+#     e_f = signal.lfilter(b_inv, a_inv, oneshot_u)
 
-# Calculate the fictitious reference `r_f`
-r_f = e_f + y_d
+#     # Calculate the fictitious reference `r_f`
+#     r_f = e_f + y_d
+
+#     return r_f, e_f
+
+def calculate_fictitious_reference_pid(oneshot_u, y_d, dt, params):
+    """
+    Calculates the fictitious reference by NUMERICALLY inverting the controller.
+    This is more robust than deriving transfer function coefficients.
+    """
+    Kp, Ki, Kd, Tf = params
+
+    # We need to find the error signal `e_f` that would have produced `oneshot_u`.
+    # u[k] = Kp*e[k] + Ki*integral[k] + D_term[k]
+    # This is a system of equations that is hard to invert directly.
+    # A simpler and correct approach is to derive the true transfer function for
+    # the implemented controller.
+
+    # Let's derive the correct transfer function C(z) = U(z)/E(z) for the implementation.
+    # P(z)/E(z) = Kp
+    # I(z)/E(z) = Ki*dt / (1 - z^-1)
+    # D(z)/E(z) = (Kd/dt) * alpha * (1 - z^-1) / (1 - (1-alpha)z^-1)
+    # where alpha = dt / (Tf + dt)
+
+    alpha = dt / (Tf + dt)
+
+    # Combine all terms over a common denominator: (1 - z^-1) * (1 - (1-alpha)z^-1)
+    # Denominator polynomial: 1 - (2-alpha)z^-1 + (1-alpha)z^-2
+    a_C0 = [1, -(2 - alpha), (1 - alpha)]
+
+    # Numerator is more complex:
+    # Kp_term = Kp * (1 - (2-alpha)z^-1 + (1-alpha)z^-2)
+    # Ki_term = Ki*dt * (1 - (1-alpha)z^-1)
+    # Kd_term = (Kd/dt)*alpha * (1 - z^-1)*(1-z^-1) = (Kd/dt)*alpha * (1 - 2z^-1 + z^-2)
+    # Sum the coefficients for z^0, z^-1, z^-2
+    b0 = Kp + Ki*dt + (Kd/dt)*alpha
+    b1 = -Kp*(2-alpha) - Ki*dt*(1-alpha) - 2*(Kd/dt)*alpha
+    b2 = Kp*(1-alpha) + (Kd/dt)*alpha
+    b_C0 = [b0, b1, b2]
+    
+    # The inverse controller 1/C0(z) swaps the coefficients.
+    b_inv = a_C0
+    a_inv = b_C0
+
+    # This check is crucial. If the inverse is unstable, something is wrong.
+    # The poles of the inverse are the zeros of the forward controller.
+    if np.any(np.abs(np.roots(a_inv)) > 1.0):
+        print("WARNING: Inverse controller is unstable. FRIT will likely fail.")
+        # This can happen if the optimizer picks pathological PID values.
+        # We return a very high cost to steer it away.
+        # In this function, we can't return a cost, but we can return a zero signal.
+        return np.zeros_like(y_d), np.zeros_like(y_d)
+
+
+    # Calculate the fictitious error `e_f` by filtering `u` with the inverse controller
+    e_f = signal.lfilter(b_inv, a_inv, oneshot_u)
+
+    # Calculate the fictitious reference `r_f`
+    r_f = e_f + y_d
+
+    return r_f, e_f
+
+def calculate_fictitious_reference_ll(oneshot_u, y_d, dt, params):
+    """
+    Calculates the fictitious reference signal based on the control input and desired output.
+    This is used for the FRIT optimization.
+    """
+    # Get the Tustin-discretized forward controller coefficients
+    # (These are the same as inside the class, calculated again for clarity)
+    K_init, z_init, p_init = params
+    den_k_init = (p_init * dt + 2)
+    b0_C0 = K_init * (z_init * dt + 2) / den_k_init
+    b1_C0 = K_init * (z_init * dt - 2) / den_k_init
+    a1_C0 = (p_init * dt - 2) / den_k_init
+
+    # B(z) numerator coefficients of FORWARD controller C0(z)
+    b_forward = [b0_C0, b1_C0]
+    # A(z) denominator coefficients of FORWARD controller C0(z)
+    a_forward = [1.0, a1_C0]
+
+    # For the INVERSE controller 1/C0(z), we just swap them:
+    b_inverse = a_forward
+    a_inverse = b_forward
+
+    # print(f"Forward C(z) Numerator (B): {np.round(b_forward, 3)}")
+    # print(f"Forward C(z) Denominator (A): {np.round(a_forward, 3)}")
+    # print(f"Inverse C(z) Numerator (A): {np.round(b_inverse, 3)}")
+    # print(f"Inverse C(z) Denominator (B): {np.round(a_inverse, 3)}")
+
+    # Calculate the fictitious error `e_f` by filtering `u` with the inverse controller
+    e_f = signal.lfilter(b_inverse, a_inverse, oneshot_u)
+
+    # Calculate the fictitious reference `r_f`
+    r_f = e_f + y_d
+    return r_f, e_f
 
 # --- 7. Plot the Results for Visualization ---
+def plot_fictitious_reference(t, oneshot_r, y_d, r_f, e_f):
+    """
+    Plots the fictitious reference and the error signal.
+    """
+    plt.style.use('seaborn-v0_8-whitegrid')
+    plt.figure(figsize=(12, 6))
 
-plt.style.use('seaborn-v0_8-whitegrid')
-plt.figure(figsize=(12, 6))
+    plt.plot(t, oneshot_r, 'k:', label='Original Reference (r)')
+    plt.plot(t, y_d, '--', color='green', label='Desired Output (y_d)', linewidth=2)
+    plt.plot(t, r_f, label='Fictitious Reference (r_f)', color='purple', linewidth=2)
 
-plt.plot(t, oneshot_r, 'k:', label='Original Reference (r)')
-plt.plot(t, y_d, '--', color='green', label='Desired Output (y_d)', linewidth=2)
-plt.plot(t, r_f, label='Fictitious Reference (r_f)', color='purple', linewidth=2)
+    plt.title('Fictitious Reference Calculation')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Signal Value')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
-plt.title('Fictitious Reference Calculation')
-plt.xlabel('Time (s)')
-plt.ylabel('Signal Value')
-plt.legend()
-plt.grid(True)
-plt.show()
-
-# Print shapes to confirm
-print(f"Shape of fictitious error data (e_f): {e_f.shape}")
-print(f"Shape of fictitious reference data (r_f): {r_f.shape}")
+    # # Print shapes to confirm
+    # print(f"Shape of fictitious error data (e_f): {e_f.shape}")
+    # print(f"Shape of fictitious reference data (r_f): {r_f.shape}")
 
 
 def cost_function_pid(params, r_f, y_meas, u_meas, dt):
@@ -287,21 +337,22 @@ def cost_function_pid(params, r_f, y_meas, u_meas, dt):
     The cost is the sum of squared errors between the measured control signal
     and the one calculated with the new parameters.
     """
-    Kp, Ki, Kd = params
+    Kp, Ki, Kd, Tf = params
     
-    # Calculate the error for the new controller
-    error_new = r_f - y_meas
-    
-    # Simulate the new controller's output u_new
+    # Add constraints to keep parameters reasonable
+    if any(p < 0 for p in params):
+        return 1e10 # All params must be positive
+    if Tf > 1.0: # Filter time constant shouldn't be excessively large
+        return 1e10
+
+    # Simulate the new PID controller's output u_new
+    temp_controller = PIDControllerWithFilter(Kp, Ki, Kd, Tf, dt)
     u_new = np.zeros_like(u_meas)
-    integral, previous_error = 0, 0
+    error_new = r_f - y_meas
     for i in range(len(error_new)):
-        integral += error_new[i] * dt
-        derivative = (error_new[i] - previous_error) / dt
-        previous_error = error_new[i]
-        u_new[i] = Kp * error_new[i] + Ki * integral + Kd * derivative
+        u_new[i] = temp_controller.calculate(error_new[i])
         
-    # Return the cost (Mean Squared Error)
+    # Return the cost
     return np.mean((u_meas - u_new)**2)
 
 def cost_function_leadlag(params, r_f, y_meas, u_meas, dt):
@@ -318,54 +369,165 @@ def cost_function_leadlag(params, r_f, y_meas, u_meas, dt):
         
     return np.mean((u_meas - u_new)**2)
 
-print("--- FRIT Optimization Results ---")
-print(f"Initial PID Gains: Kp={Kp_init:.2f}, Ki={Ki_init:.2f}, Kd={Kd_init:.2f}")
-
-# Initial guess for the optimization can be the initial parameters
-# Run the optimization
-# initial_guess = [Kp_init, Ki_init, Kd_init]
-# result = minimize(cost_function_pid, initial_guess, args=(r_f, oneshot_y, oneshot_u, dt),
-#                   method='Nelder-Mead')
-# Extract the optimized parameters
-# Kp_opt, Ki_opt, Kd_opt = result.x
-# print(f"Optimized PID Gains: Kp={Kp_opt:.2f}, Ki={Ki_opt:.2f}, Kd={Kd_opt:.2f}")
-
-initial_guess_ll = [5.0, 1.0, 10.0] # K, zero, pole
-result_ll = minimize(cost_function_leadlag, initial_guess_ll, args=(r_f, oneshot_y, oneshot_u, dt),
-                  method='Nelder-Mead')
-K_opt, z_opt, p_opt = result_ll.x
-print(f"Optimized Lead-Lag Gains: K={K_opt:.2f}, zero={z_opt:.2f}, pole={p_opt:.2f}")
-print(f"Final Cost: {result_ll.fun:.4f}")
-
-# --- 8. Validation with a New Simulation ---
-final_ll_controller = LeadLagController(K_opt, z_opt, p_opt, dt)
-state = np.zeros(4)
-history_x2_opt = np.zeros(n_steps + 1)
-integral, previous_error = 0, 0
-for i in range(n_steps):
-    measured_x2 = state[2] + np.random.normal(0, noise_std_dev)
-    error = r[i] - measured_x2
-    # PID
-    # integral += error * dt
-    # derivative = (error - previous_error) / dt
-    # previous_error = error
-    # u = Kp_opt * error + Ki_opt * integral + Kd_opt * derivative
-    # LEAD-LAG
-    u = final_ll_controller.calculate(error)
-    state_dot = two_mass_spring_damper(state, t[i], u)
-    state += np.array(state_dot) * dt
-    history_x2_opt[i] = measured_x2
-history_x2_opt[-1] = state[2] + np.random.normal(0, noise_std_dev)
+# print("--- FRIT Optimization Results ---")
+# print(f"Initial PID Gains: Kp={Kp_init:.2f}, Ki={Ki_init:.2f}, Kd={Kd_init:.2f}")
 
 # --- 9. Plot Final Results ---
-plt.style.use('seaborn-v0_8-whitegrid')
-plt.figure(figsize=(14, 7))
-plt.plot(t, oneshot_y, label='Initial Response (Untuned)', alpha=0.5)
-plt.plot(t, history_x2_opt, 'b', label='FRIT-Tuned Response', linewidth=2.5)
-plt.plot(t, y_d, 'r--', label='Desired Reference Model', linewidth=2.5)
-plt.title('FRIT Performance: Initial vs. Optimized Controller', fontsize=16)
-plt.xlabel('Time (s)', fontsize=12)
-plt.ylabel('Position of Mass 2 (m)', fontsize=12)
-plt.legend(fontsize=12)
-plt.grid(True)
-plt.show()
+def plot_final_results(t, oneshot_y, history_x2_opt, y_d, original_y=None):
+    plt.style.use('seaborn-v0_8-whitegrid')
+    plt.figure(figsize=(14, 7))
+    plt.plot(t, oneshot_y, label='Initial Response (Untuned)', alpha=0.5)
+    plt.plot(t, history_x2_opt, 'b', label='FRIT-Tuned Response', linewidth=2.5)
+    plt.plot(t, y_d, 'r--', label='Desired Reference Model', linewidth=2.5)
+    plt.title('FRIT Performance: Initial vs. Optimized Controller', fontsize=16)
+    if original_y is not None:
+        plt.plot(t, original_y, 'g--', label='Original Response', alpha=0.5)
+    plt.xlabel('Time (s)', fontsize=12)
+    plt.ylabel('Position of Mass 2 (m)', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True)
+    plt.show()
+
+def run_simulation(controller, r, t, noise_std_dev, dt):
+    state = np.zeros(4)
+    history_x2 = np.zeros(len(t))
+    history_u = np.zeros(len(t))
+    measured_x2_history = np.zeros(len(t))
+    for i in range(len(t)-1):
+        measured_x2 = state[2] + np.random.normal(0, noise_std_dev)
+        measured_x2_history[i] = measured_x2
+        history_x2[i] = state[2]
+        error = r[i] - measured_x2
+        u = controller.calculate(error)
+        history_u[i] = u
+        state_dot = plant(state, t[i], u)
+        state = state + np.array(state_dot) * dt
+    history_x2[-1] = state[2]
+    measured_x2_history[-1] = state[2] + np.random.normal(0, noise_std_dev)
+    history_u[-1] = history_u[-2]
+    return measured_x2_history, history_u, r
+
+def optimize_controller(fun, r_f, y_meas, u_meas, dt, initial_guess, bounds=None):
+    """ Modified to accept and use bounds. """
+    # method='Nelder-Mead', # Note: Nelder-Mead does not support bounds. Switching to a method that does.
+    # L-BFGS-B is a good choice for box-constrained optimization.
+    if bounds is None:
+        method='Nelder-Mead'
+    else:
+        method='L-BFGS-B'
+    result = minimize(fun, initial_guess, 
+                      args=(r_f, y_meas, u_meas, dt), 
+                      method=method,
+                      bounds=bounds)
+    return result.x, result.fun
+
+
+# Calculate the new "ideal" control target u_d
+def calculate_ideal_control_target(Kp_init, Ki_init, Kd_init, Tf_init, dt, r_0, y_d):
+    ideal_error = r_0 - y_d # The error if performance were perfect
+    u_d = np.zeros_like(r_0)
+    # We must re-instantiate the controller to reset its internal states
+    temp_C0 = PIDControllerWithFilter(Kp_init, Ki_init, Kd_init, Tf_init, dt)
+    for i in range(len(ideal_error)):
+        u_d[i] = temp_C0.calculate(ideal_error[i])
+    return u_d
+
+# Calculate an "oracle" aggressive control signal
+def calculate_oracle_control_signal( Kp_init, Ki_init, Kd_init, Tf_init, dt, r_0, y_d, u_0):
+    # These are high-gain parameters representing what a good controller *might* do
+    # This is a design choice to provide the upward pressure.
+    Kp_oracle, Ki_oracle, Kd_oracle, Tf_oracle = Kp_init*3, Ki_init*3, Kd_init*3, 0.01
+    oracle_controller = PIDControllerWithFilter(Kp_oracle, Ki_oracle, Kd_oracle, Tf_oracle, dt)
+    ideal_error = r_0 - y_d
+    u_oracle = np.zeros_like(r_0)
+    for i in range(len(ideal_error)):
+        u_oracle[i] = oracle_controller.calculate(ideal_error[i])
+
+    # Create the HYBRID target signal
+    alpha = 0.2 # Blending factor. This is a key tuning parameter.
+    u_target = (1 - alpha) * u_0 + alpha * u_oracle
+
+    return u_target
+
+def main():
+    # --- SETUP (Identical) ---
+    dt = 0.01; T = 10; n_steps = int(T / dt); t = np.linspace(0, T, n_steps + 1)
+    r = np.ones(n_steps + 1) * 1.0; zeta, omega_n = 0.7, 2.0; noise_std_dev = 0.03
+
+    # --- INITIAL EXPERIMENT (with the starting PID Controller) ---
+    # This is C_0
+    Kp_init, Ki_init, Kd_init, Tf_init = 1.0, 0.5, 1.0, 0.05
+    initial_controller = PIDControllerWithFilter(Kp_init, Ki_init, Kd_init, Tf_init, dt)
+    
+    # This is (y_0, u_0)
+    y_0, u_0, r_0 = run_simulation(initial_controller, r, t, noise_std_dev, dt)
+    y_d = desired_response(t, r, zeta=zeta, omega_n=omega_n)
+    
+    print("Showing initial controller performance...")
+    plot_results(t, y_0, u_0, r_0, y_d, zeta=zeta, omega_n=omega_n)
+    
+    # --- ITERATIVE TUNING LOOP ---
+    N_iterations = 15 # Let's do 5 iterations to see clear convergence
+    
+    # Initialize the parameters and simulation data for the loop
+    current_pid_params = [Kp_init, Ki_init, Kd_init, Tf_init]
+    sim_y = y_0
+    sim_u = u_0
+
+    for i in range(N_iterations):
+        print(f"\n--- Starting FRIT Iteration {i+1} ---")
+        
+        # STEP 1: Calculate r_f using the inverse of the controller (C_i) and
+        # the data (y_i, u_i) from the PREVIOUS iteration.
+        print(f"Calculating r_f using controller from Iteration {i}...")
+        r_f_iter, _ = calculate_fictitious_reference_pid(sim_u, y_d, dt, current_pid_params)
+
+        # Calculate the new "ideal" control target u_d
+        # sim_u = calculate_ideal_control_target(current_pid_params[0], current_pid_params[1], 
+        #                                      current_pid_params[2], current_pid_params[3], 
+        #                                      dt, r_f_iter, y_d)
+        sim_u = calculate_oracle_control_signal( current_pid_params[0], current_pid_params[1], 
+                                             current_pid_params[2], current_pid_params[3],
+                                              dt, r_f_iter, y_d, sim_u)
+        # STEP 2: Optimize for the next controller (C_{i+1}) using the data from
+        # the previous iteration (y_i, u_i) and the new r_f.
+        # We start the search from the last known best parameters.
+        print(f"Optimizing for new controller parameters...")
+        # We state that each parameter must be at least its initial value.
+        # We set the upper bound to None (or a very large number) for infinity.
+        param_bounds = [
+            (current_pid_params[0], None),  # Kp must be >= Kp_init
+            (current_pid_params[1], None),  # Ki must be >= Ki_init
+            (current_pid_params[2], None),  # Kd must be >= Kd_init
+            (0.001, None)   # Tf must be >= Tf_init (or you could give it a small lower bound like 0.001)
+        ]
+        print(f"Using Bounds: {param_bounds}")
+        # new_pid_params, cost = optimize_controller(
+        #     cost_function_pid, r_f_iter, sim_y, sim_u, dt, current_pid_params
+        # )
+        new_pid_params, cost = optimize_controller(
+            cost_function_pid, r_f_iter, sim_y, sim_u, dt, current_pid_params)#, bounds=param_bounds)
+        
+        print(f"Result (Iter {i+1}): Kp={new_pid_params[0]:.2f}, Ki={new_pid_params[1]:.2f}, Kd={new_pid_params[2]:.2f}, Tf={new_pid_params[3]:.4f}, cost={cost:.6f}")
+
+        # Update the current parameters to the new ones we just found
+        current_pid_params = new_pid_params
+        
+        # STEP 3: Run a NEW simulation with the NEWLY optimized controller (C_{i+1})
+        # to generate the dataset (y_{i+1}, u_{i+1}) for the NEXT loop.
+        print("Validating new controller and generating data for next iteration...")
+        current_controller = PIDControllerWithFilter(
+            current_pid_params[0], current_pid_params[1], 
+            current_pid_params[2], current_pid_params[3], dt
+        )
+        sim_y, sim_u, _ = run_simulation(current_controller, r, t, noise_std_dev, dt)
+        
+        # Plot the progress, comparing to the very first response
+        plot_final_results(t, y_0, sim_y, y_d)
+        
+    print("\n--- Iterative FRIT Process Complete ---")
+
+
+
+if __name__ == "__main__":
+    main()
