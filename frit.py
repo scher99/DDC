@@ -7,13 +7,13 @@ from scipy.optimize import minimize
 # --- 1. Define the "Hidden" Plant: Two-Mass Spring-Damper System ---
 
 # Global system parameters
-m1 = 2.0  # kg
-m2 = 1.0  # kg
-k1 = 1.0  # N/m
-k2 = 1.5  # N/m
-c1 = 0.8  # Ns/m
-c2 = 0.6  # Ns/m
-mu = 0.1  # Friction coefficient
+m1 = 1.0  # kg
+m2 = 18.0  # kg
+k1 = 0.0  # N/m
+k2 = (32.0*2*np.pi)**2  # N/m
+c1 = 75.0  # Ns/m
+c2 = 300.0  # Ns/m
+mu = 0.0  # Friction coefficient
 Fc = 0.1  # Coulomb friction force
 
 # plant = two_mass_spring_damper. this is hidden, we use it only to generate data
@@ -34,9 +34,10 @@ def plant(state, t, F):
     f_coulomb2 = -Fc * np.sign(x2_dot) if x2_dot != 0 else 0.0
 
     # Equations of motion
-    x1_ddot = (F - k1*x1 - c1*x1_dot - k2*(x1 - x2) - c2*(x1_dot - x2_dot) + f_friction1 + f_coulomb1) / m1
-    x2_ddot = (k2*(x1 - x2) + c2*(x1_dot - x2_dot) + f_friction2 + f_coulomb2) / m2
-
+    # x1_ddot = (F - k1*x1 - c1*x1_dot - k2*(x1 - x2) - c2*(x1_dot - x2_dot) + f_friction1 + f_coulomb1) / m1
+    # x2_ddot = (k2*(x1 - x2) + c2*(x1_dot - x2_dot) + f_friction2 + f_coulomb2) / m2
+    x1_ddot = (F - c1*x1_dot - k2*(x1 - x2) + f_friction1 + f_coulomb1) / m1
+    x2_ddot = (k2*(x1 - x2) - c2*(x2_dot) + f_friction2 + f_coulomb2) / m2
     return [x1_dot, x1_ddot, x2_dot, x2_ddot]
 
 # --- 2. Define the Initial, Poorly-Tuned PID Controller ---
@@ -327,7 +328,7 @@ def cost_function(params, y_0, u_0, t, dt, M_tf):
     where r_fict depends on the new controller parameters.
     """
     # Basic parameter constraints
-    if any(p < 0.001 for p in params): return 1e10
+    # if any(p < 0.000 for p in params): return 1e10
     if params[-1] > 1.0: return 1e10
 
     try:
@@ -338,7 +339,7 @@ def cost_function(params, y_0, u_0, t, dt, M_tf):
         _, y_sim, _ = signal.lsim(M_tf, U=r_fict, T=t)
 
         # Step 4: The cost is the error between the real output and this simulated ideal output
-        cost = np.mean((y_0 - y_sim)**2)
+        cost = np.mean((y_0 - y_sim)**2) + 100*np.max((y_0 - y_sim)**2) #+ np.std((y_0[0:1000] - y_sim[0:1000])**2)
 
     except Exception as e:
         return 1e10 # Return high cost if any numerical instability occurs
@@ -404,21 +405,22 @@ def plot_final_results(t, r, oneshot_y, history_x2_opt, y_d, original_y=None):
     plt.show()
 
 def run_simulation(controller, r, t, noise_std_dev, dt):
+    # state[2] = x2, state[3]=x2_dot
     state = np.zeros(4)
     history_x2 = np.zeros(len(t))
     history_u = np.zeros(len(t))
     measured_x2_history = np.zeros(len(t))
     for i in range(len(t)-1):
-        measured_x2 = state[2] + np.random.normal(0, noise_std_dev)
+        measured_x2 = state[3] + np.random.normal(0, noise_std_dev)
         measured_x2_history[i] = measured_x2
-        history_x2[i] = state[2]
+        history_x2[i] = state[3] # Rate of change of x2
         error = r[i] - measured_x2
         u = controller.calculate(error)
         history_u[i] = u
         state_dot = plant(state, t[i], u)
         state = state + np.array(state_dot) * dt
-    history_x2[-1] = state[2]
-    measured_x2_history[-1] = state[2] + np.random.normal(0, noise_std_dev)
+    history_x2[-1] = state[3]
+    measured_x2_history[-1] = state[3] + np.random.normal(0, noise_std_dev)
     history_u[-1] = history_u[-2]
     return measured_x2_history, history_u, r
 
@@ -438,14 +440,99 @@ def optimize_controller(fun, t, y_meas, u_meas, dt, initial_guess, bounds=None, 
 
 def main():
     # --- SETUP ---
-    dt = 0.001; T = 10; n_steps = int(T / dt); t = np.linspace(0, T, n_steps + 1)
-    r = np.ones(n_steps + 1) * 1.0; #r[0:int(1/dt)] = 0.0; r[int(6/dt):int(8/dt)] = 0.0
-    zeta, omega_n = 0.9, 4.0; noise_std_dev = 0.003
+    dt = 0.001; T = 5; n_steps = int(T / dt); t = np.linspace(0, T, n_steps + 1)
+    r = np.ones(n_steps + 1) * 1.0; r[0:int(1/dt)] = 0.0; r[int(4/dt):int(8/dt)] = 0.0
+    # zeta, omega_n = 0.7, 10.0*2*np.pi; 
+    noise_std_dev = 0.003
+
+    # --- Draw Bode Plot of Linearized Plant ---
+    # Linearize the plant: neglect friction and Coulomb nonlinearities
+    # State-space: [x1, x1_dot, x2, x2_dot]
+    # Input: F (force on mass 1)
+    # Output: x2 (position of mass 2)
+    # Build A, B, C, D matrices
+    A = np.array([
+        [0, 1, 0, 0],
+        [-k2/m1, -c1/m1, k2/m1, 0],
+        [0, 0, 0, 1],
+        [k2/m2, 0, -k2/m2, -c2/m2]
+    ])
+    B = np.array([[0], [1/m1], [0], [0]])
+    C = np.array([[0, 0, 0, 1]])  # Output x2
+    D = np.array([[0]])
+
+    # Create state-space system and convert to transfer function
+    sys_ss = signal.StateSpace(A, B, C, D)
+    sys_tf = signal.TransferFunction(*signal.ss2tf(A, B, C, D))
+
+    # Plot Bode plot
+    w, mag, phase = signal.bode(sys_tf)
+    # plt.figure(figsize=(10,6))
+    # plt.subplot(2,1,1)
+    # plt.semilogx(w, mag)
+    # plt.title("Bode Plot of Linearized Plant (x2/F)")
+    # plt.ylabel("Magnitude (dB)")
+    # plt.grid(True, which='both')
+    # plt.subplot(2,1,2)
+    # plt.semilogx(w, phase)
+    # plt.xlabel("Frequency (rad/s)")
+    # plt.ylabel("Phase (deg)")
+    # plt.grid(True, which='both')
+    # plt.tight_layout()
+    # plt.show()
+
+    # --- PI Controller Design via Pole Placement ---
+    # Desired closed-loop bandwidth (omega_n) and damping ratio (zeta)
+    omega_n = 10 * np.pi * 2  # rad/s
+    zeta = 0.8
+
+    # The plant transfer function: sys_tf (from above)
+    # For a PI controller: C(s) = Kp + Ki/s
+    # Closed-loop characteristic equation: Den(s) + Num(s)*C(s) = 0
+
+    # Get plant numerator and denominator
+    num_p, den_p = sys_tf.num, sys_tf.den
+
+    # For a SISO system, assume plant: G(s) = b/(s^2 + a1*s + a0)
+    # PI controller: C(s) = Kp + Ki/s
+    # Closed-loop TF: G(s)*C(s)/(1 + G(s)*C(s))
+    # Characteristic equation: den_p(s)*s + num_p(s)*(Kp*s + Ki) = 0
+
+    # For our plant, num_p = [k], den_p = [1, a1, a0, 0] (third order due to double integrator)
+    # But for two-mass system, let's use only the dominant mode for pole placement:
+    # For simplicity, use the low-frequency approximation: G(s) ≈ k/(m2*s^2 + c2*s + k2)
+    # So, G(s) ≈ k2/(m2*s^2 + c2*s + k2)
+
+    # PI controller: C(s) = Kp + Ki/s
+    # Open-loop: G(s)*C(s) = [Kp*k2 + Ki*k2/s]/(m2*s^2 + c2*s + k2)
+    # Closed-loop characteristic equation:
+    # m2*s^2 + c2*s + k2 + Kp*k2*s + Ki*k2 = 0
+    # Group terms:
+    # m2*s^2 + (c2 + Kp*k2)*s + (k2 + Ki*k2) = 0
+
+    # Set desired characteristic equation: s^2 + 2*zeta*omega_n*s + omega_n^2 = 0
+    # Match coefficients:
+    # m2*s^2 + (c2 + Kp*k2)*s + (k2 + Ki*k2) = m2*(s^2 + 2*zeta*omega_n*s + omega_n^2)
+    # So:
+    # s^2: m2 = m2
+    # s^1: c2 + Kp*k2 = m2*2*zeta*omega_n  => Kp = (m2*2*zeta*omega_n - c2)/k2
+    # s^0: k2 + Ki*k2 = m2*omega_n^2       => Ki = (m2*omega_n**2 - k2)/k2
+
+    Kp_pi = (m2 * 2 * zeta * omega_n - c2) / k2 /dt
+    Ki_pi = (m2 * omega_n**2 - k2) / k2 / dt
+
+    print(f"Pole Placement PI Controller: Kp = {Kp_pi:.4f}, Ki = {Ki_pi:.4f}")
+
+    # You can now use these gains in PIDController or PIDControllerWithFilter (with Kd=0, Tf=0.05)
+    # pi_controller = PIDControllerWithFilter(Kp_pi, Ki_pi, 0.0, 0.05, dt)
+    # y_pi, u_pi, r_pi = run_simulation(pi_controller, r, t, noise_std_dev, dt)
+    # y_d = desired_response(t, r, zeta=zeta, omega_n=omega_n)
+    # plot_results(t, y_pi, u_pi, r_pi, y_d, zeta=zeta, omega_n=omega_n)
 
     # --- INITIAL EXPERIMENT (with the starting PID Controller) ---
     # This is C_0
     # Kp_init, Ki_init, Kd_init, Tf_init = 1.0, 0.5, 1.0, 0.05
-    Kp_init, Ki_init, Kd_init, Tf_init = 2.0, 0.5, 8.0, 0.05
+    Kp_init, Ki_init, Kd_init, Tf_init = Kp_pi, Ki_pi, 0.0, 0.05
     initial_controller = PIDControllerWithFilter(Kp_init, Ki_init, Kd_init, Tf_init, dt)
     
     # This is (y_0, u_0)
@@ -455,7 +542,7 @@ def main():
     M_tf = signal.TransferFunction([omega_n**2], [1, 2*zeta*omega_n, omega_n**2])
     
     print("Showing initial controller performance...")
-    plot_results(t, y_0, u_0, r_0, y_d, zeta=zeta, omega_n=omega_n)
+    # plot_results(t, y_0, u_0, r_0, y_d, zeta=zeta, omega_n=omega_n)
     
     # --- ITERATIVE TUNING LOOP ---
     N_iterations = 1 # Let's do 5 iterations to see clear convergence
@@ -484,7 +571,7 @@ def main():
         #     (0.001, None),  # Kp must be >= Kp_init
         #     (0.001, None),  # Ki must be >= Ki_init
         #     (0.001, None),  # Kd must be >= Kd_init
-        #     (0.001, None)   # Tf must be >= Tf_init (or you could give it a small lower bound like 0.001)
+        #     (0.001, 0.05)   # Tf must be >= Tf_init (or you could give it a small lower bound like 0.001)
         # ]
         param_bounds = None
         # print(f"Using Bounds: {param_bounds}")
