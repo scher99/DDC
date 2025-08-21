@@ -6,11 +6,11 @@ import matplotlib.pyplot as plt
 # --- Step 1: Define the Hidden Plant ---
 def create_two_mass_spring_damper(m1=1.0, m2=1.5, k1=1.0, k2=0.5, b1=0.2, b2=0.1, Ts=0.1):
     A = [[0, 1, 0, 0],
-         [-(k1+k2)/m1, -(b1+b2)/m1, k2/m1, b2/m1],
+         [-k2/m1, -b1/m1, k2/m1, 0],
          [0, 0, 0, 1],
-         [k2/m2, b2/m2, -k2/m2, -b2/m2]]
+         [k2/m2, 0, -k2/m2, -b2/m2]]
     B = [[0], [1/m1], [0], [0]]
-    C = [[1, 0, 0, 0]]
+    C = [[0, 0, 0, 1]] # measure x2dot
     D = [[0]]
     continuous_sys = signal.StateSpace(A, B, C, D)
     discrete_sys_tf = continuous_sys.to_tf().to_discrete(dt=Ts)
@@ -113,7 +113,6 @@ def oci_identify_controller(u, y, M, Ts, N=20):
     b_opt, _, _, _ = lstsq(regressor[:-1], target)
     b0, b1, b2 = b_opt
     
-    # --- CORRECTED ALGEBRAIC INVERSION ---
     # This is the key fix to the negative coefficient problem.
     Ki = (b0 + b1 + b2) / (2 * Ts)
     Kp = (b2 - (b0 - Ki*Ts)) / (Ts*N - 1)
@@ -140,7 +139,7 @@ def validate_and_plot(plant, controller_params, M, Ts, N=20):
     den_cl = np.polyadd(np.polymul(plant.den.flatten(), controller.den.flatten()), num_cl)
     oci_closed_loop = signal.TransferFunction(num_cl, den_cl, dt=Ts)
     
-    sim_time = 50
+    sim_time = 5
     N_sim = int(sim_time / Ts)
     t = np.linspace(0, sim_time, N_sim)
     ref_signal = np.ones(N_sim)
@@ -177,19 +176,26 @@ def validate_and_plot(plant, controller_params, M, Ts, N=20):
 
 # --- Main Simulation Orchestrator ---
 if __name__ == '__main__':
-    SAMPLING_TIME = 0.01
-    FILTER_COEFF = 10
-    SIM_TIME_IDENT=200
+    SAMPLING_TIME = 0.001
+    FILTER_COEFF = 3
+    SIM_TIME_IDENT=40
+
+    m1 = 1.0  # kg
+    m2 = 18.0  # kg
+    k1 = 0.0  # N/m
+    k2 = (32.0*2*np.pi)**2  # N/m
+    b1 = 75.0  # Ns/m
+    b2 = 300.0  # Ns/m
+    mu = 0.0  # Friction coefficient
+    Fc = 0.0  # Coulomb friction force
     
     plant_tf = create_two_mass_spring_damper(
-        m1=2.0, m2=1.0, k1=2.0, k2=1.0, b1=0.4, b2=0.2, Ts=SAMPLING_TIME
+        m1=m1, m2=m2, k1=k1, k2=k2, b1=b1, b2=b2, Ts=SAMPLING_TIME
     )
     reference_model_tf = create_reference_model(
-        damping=0.9, natural_freq=6.5, Ts=SAMPLING_TIME
+        damping=0.9, natural_freq=10, Ts=SAMPLING_TIME
     )
-    # time_vec, input_data, output_data = generate_simulation_data(
-    #     plant=plant_tf, sim_time=100, Ts=SAMPLING_TIME
-    # )
+    
     time_vec, input_data, output_data = generate_simulation_data(
         plant=plant_tf, sim_time=SIM_TIME_IDENT, Ts=SAMPLING_TIME, signal_type='chirp'
     )
