@@ -14,7 +14,7 @@ k2 = (32.0*2*np.pi)**2  # N/m
 c1 = 75.0  # Ns/m
 c2 = 300.0  # Ns/m
 mu = 0.0  # Friction coefficient
-Fc = 0.1  # Coulomb friction force
+Fc = 0.0  # Coulomb friction force
 
 # plant = two_mass_spring_damper. this is hidden, we use it only to generate data
 def plant(state, t, F):
@@ -114,6 +114,83 @@ class LeadLagController:
         self.previous_u = u
         return u
 
+class ComplexController:
+    """
+    A controller cascading a PID, Lead, Lag, and Notch filter.
+    C_total = C_notch * C_lag * C_lead * C_pid
+    """
+    def __init__(self, params, dt):
+        (self.Kp, self.Ki, self.Kd, self.Tf, 
+         self.z_lead, self.p_lead, 
+         self.z_lag, self.p_lag, 
+         self.w0_notch, self.Q_notch) = params
+        self.dt = dt
+
+        # --- Internal states for each filter stage ---
+        # PID states (unchanged)
+        self.pid_integral = 0; self.pid_prev_error = 0; self.pid_filt_deriv = 0
+        self.pid_alpha = self.dt / (self.Tf + self.dt if self.Tf > 0 else 1e-9)
+        
+        # Lead filter states and coefficients (unchanged)
+        den_k_lead = (self.p_lead * self.dt + 2); self.lead_b0 = (self.z_lead * self.dt + 2) / den_k_lead
+        self.lead_b1 = (self.z_lead * self.dt - 2) / den_k_lead; self.lead_a1 = (self.p_lead * self.dt - 2) / den_k_lead
+        self.lead_prev_in = 0; self.lead_prev_out = 0
+
+        # Lag filter states and coefficients (unchanged)
+        den_k_lag = (self.p_lag * self.dt + 2); self.lag_b0 = (self.z_lag * self.dt + 2) / den_k_lag
+        self.lag_b1 = (self.z_lag * self.dt - 2) / den_k_lag; self.lag_a1 = (self.p_lag * self.dt - 2) / den_k_lag
+        self.lag_prev_in = 0; self.lag_prev_out = 0
+
+        # --- CORRECTED Notch filter states and coefficients (Bilinear Transform) ---
+        w0, Q = self.w0_notch, self.Q_notch
+        if w0 < 1e-3 or Q < 1e-3: # Handle case of inactive notch
+            self.notch_b0, self.notch_b1, self.notch_b2 = 1.0, 0.0, 0.0
+            self.notch_a1, self.notch_a2 = 0.0, 0.0
+        else:
+            # Intermediate terms for clarity, based on the standard Audio EQ Cookbook formulas
+            wc = w0 * self.dt
+            alpha = np.sin(wc) / (2.0 * Q)
+            cos_wc = np.cos(wc)
+            
+            a0_inv = 1.0 / (1.0 + alpha) # Pre-calculate normalization factor
+            
+            # Normalized coefficients for H(z) = (b0+b1z^-1+b2z^-2)/(1+a1z^-1+a2z^-2)
+            self.notch_b0 = a0_inv
+            self.notch_b1 = -2.0 * cos_wc * a0_inv
+            self.notch_b2 = a0_inv
+            self.notch_a1 = -2.0 * cos_wc * a0_inv
+            self.notch_a2 = (1.0 - alpha) * a0_inv
+
+        self.notch_prev_in1, self.notch_prev_in2 = 0, 0
+        self.notch_prev_out1, self.notch_prev_out2 = 0, 0
+
+    def calculate(self, error):
+        # Stage 1: PID (unchanged)
+        self.pid_integral += error * self.dt
+        unfiltered_deriv = (error - self.pid_prev_error)
+        self.pid_filt_deriv = self.pid_alpha * (self.pid_filt_deriv + unfiltered_deriv)
+        pid_out = (self.Kp * error + self.Ki * self.pid_integral + (self.Kd / self.dt) * self.pid_filt_deriv)
+        self.pid_prev_error = error
+        
+        # Stage 2: Lead Filter (unchanged)
+        lead_out = -self.lead_a1 * self.lead_prev_out + self.lead_b0 * pid_out + self.lead_b1 * self.lead_prev_in
+        self.lead_prev_in = pid_out; self.lead_prev_out = lead_out
+        
+        # Stage 3: Lag Filter (unchanged)
+        lag_out = -self.lag_a1 * self.lag_prev_out + self.lag_b0 * lead_out + self.lag_b1 * self.lag_prev_in
+        self.lag_prev_in = lead_out; self.lag_prev_out = lag_out
+        
+        # --- CORRECTED Stage 4: Notch Filter Difference Equation ---
+        notch_out = (self.notch_b0 * lag_out + self.notch_b1 * self.notch_prev_in1 + self.notch_b2 * self.notch_prev_in2 -
+                     self.notch_a1 * self.notch_prev_out1 - self.notch_a2 * self.notch_prev_out2)
+        
+        # Update notch states
+        self.notch_prev_in2 = self.notch_prev_in1
+        self.notch_prev_in1 = lag_out
+        self.notch_prev_out2 = self.notch_prev_out1
+        self.notch_prev_out1 = notch_out
+
+        return notch_out
 
 def desired_response(t, oneshot_r, zeta=0.7, omega_n=2.0):
     """
@@ -278,6 +355,58 @@ def calculate_fictitious_reference_pid(oneshot_u, y_d, dt, params):
 
     return r_f, e_f
 
+def calculate_fictitious_reference_complex(u_signal, y_signal, dt, params):
+    """
+    Calculates the fictitious reference by sequentially inverting each
+    component of the complex controller.
+    """
+    (Kp, Ki, Kd, Tf, z_lead, p_lead, z_lag, p_lag, w0_notch, Q_notch) = params
+
+    # --- Helper to get discrete Lead/Lag coefficients (unchanged) ---
+    def get_leadlag_coeffs(z, p, dt):
+        den_k = (p * dt + 2); b0 = (z * dt + 2) / den_k
+        b1 = (z * dt - 2) / den_k; a1 = (p * dt - 2) / den_k
+        return [b0, b1], [1, a1]
+
+    # --- CORRECTED Helper to get discrete Notch coefficients ---
+    def get_notch_coeffs(w0, Q, dt):
+        if w0 < 1e-3 or Q < 1e-3:
+            return [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]
+        wc = w0 * dt; alpha = np.sin(wc) / (2.0 * Q); cos_wc = np.cos(wc)
+        a0_inv = 1.0 / (1.0 + alpha)
+        
+        b0 = a0_inv; b1 = -2.0 * cos_wc * a0_inv; b2 = a0_inv
+        a1 = -2.0 * cos_wc * a0_inv; a2 = (1.0 - alpha) * a0_inv
+        
+        return [b0, b1, b2], [1.0, a1, a2] # Denominator has leading 1
+        
+    # --- Get coefficients for each forward filter component ---
+    # PID Part (unchanged)
+    alpha_pid = dt / (Tf + dt if Tf > 0 else 1e-9); a_pid = [1, -(2 - alpha_pid), (1 - alpha_pid)]
+    b0_pid = Kp + Ki*dt + (Kd/dt)*alpha_pid; b1_pid = -Kp*(2-alpha_pid) - Ki*dt*(1-alpha_pid) - 2*(Kd/dt)*alpha_pid
+    b2_pid = Kp*(1-alpha_pid) + (Kd/dt)*alpha_pid; b_pid = [b0_pid, b1_pid, b2_pid]
+    
+    # Lead/Lag Parts (unchanged)
+    b_lead, a_lead = get_leadlag_coeffs(z_lead, p_lead, dt)
+    b_lag, a_lag = get_leadlag_coeffs(z_lag, p_lag, dt)
+
+    # Notch Part (uses the new corrected helper)
+    b_notch, a_notch = get_notch_coeffs(w0_notch, Q_notch, dt)
+
+    # --- Apply inverse filters sequentially (unchanged) ---
+    if (np.any(np.abs(np.roots(b_pid)) > 1.0) or np.any(np.abs(np.roots(b_lead)) > 1.0) or
+        np.any(np.abs(np.roots(b_lag)) > 1.0) or np.any(np.abs(np.roots(b_notch)) > 1.0)):
+        return np.zeros_like(y_signal), np.zeros_like(y_signal)
+
+    s1 = signal.lfilter(a_notch, b_notch, u_signal)
+    s2 = signal.lfilter(a_lag, b_lag, s1)
+    s3 = signal.lfilter(a_lead, b_lead, s2)
+    e_f = signal.lfilter(a_pid, b_pid, s3)
+    
+    r_f = e_f + y_signal
+    return r_f, e_f
+
+
 # def calculate_fictitious_reference_ll(oneshot_u, y_d, dt, params):
 #     """
 #     Calculates the fictitious reference signal based on the control input and desired output.
@@ -339,7 +468,45 @@ def cost_function(params, y_0, u_0, t, dt, M_tf):
         _, y_sim, _ = signal.lsim(M_tf, U=r_fict, T=t)
 
         # Step 4: The cost is the error between the real output and this simulated ideal output
-        cost = np.mean((y_0 - y_sim)**2) + 100*np.max((y_0 - y_sim)**2) #+ np.std((y_0[0:1000] - y_sim[0:1000])**2)
+        cost = np.mean((y_0 - y_sim)**2) + 10*np.max((y_0 - y_sim)**2) #+ np.std((y_0[0:1000] - y_sim[0:1000])**2)
+
+        # reg = 1e-6 * np.sum(params**2)
+
+        # cost += reg  # Regularization term to prevent overfitting
+
+    except Exception as e:
+        return 1e10 # Return high cost if any numerical instability occurs
+
+    return cost
+
+def cost_function_complex(params, y_0, u_0, t, dt, M_tf):
+    """
+    Cost function for the complex cascaded controller, using the
+    robust "Output Error" formulation from the literature.
+    """
+    # Unpack all 10 parameters
+    (Kp, Ki, Kd, Tf, z_lead, p_lead, z_lag, p_lag, w0_notch, Q_notch) = params
+
+    # Basic parameter constraints
+    if any(p < 0.0 for p in [Kp, Ki, Kd, Tf, z_lead, p_lead, z_lag, p_lag, w0_notch, Q_notch]):
+        return 1e10
+    # Physical constraints: lead zero < lead pole, lag zero > lag pole
+    # if z_lead >= p_lead or z_lag <= p_lag:
+    #     return 1e10
+
+    try:
+        # Step 1: Calculate the new fictitious reference r_fict for the candidate controller
+        r_fict, _ = calculate_fictitious_reference_complex(u_0, y_0, dt, params)
+        
+        # If the inverse was unstable, r_fict will be all zeros, return high cost
+        if np.all(r_fict == 0):
+             return 1e10
+
+        # Step 2: Simulate this r_fict through the desired model M(s)
+        _, y_sim, _ = signal.lsim(M_tf, U=r_fict, T=t)
+
+        # Step 3: The cost is the error between the real output and this simulated ideal output
+        cost = np.mean((y_0 - y_sim)**2) + 100*np.max((y_0 - y_sim)**4)
 
     except Exception as e:
         return 1e10 # Return high cost if any numerical instability occurs
@@ -532,8 +699,17 @@ def main():
     # --- INITIAL EXPERIMENT (with the starting PID Controller) ---
     # This is C_0
     # Kp_init, Ki_init, Kd_init, Tf_init = 1.0, 0.5, 1.0, 0.05
-    Kp_init, Ki_init, Kd_init, Tf_init = Kp_pi, Ki_pi, 0.0, 0.05
-    initial_controller = PIDControllerWithFilter(Kp_init, Ki_init, Kd_init, Tf_init, dt)
+    # Kp_init, Ki_init, Kd_init, Tf_init = Kp_pi, Ki_pi, 0.0, 0.05
+    # initial_controller = PIDControllerWithFilter(Kp_init, Ki_init, Kd_init, Tf_init, dt)
+    # --- Define the full initial parameter set for the Complex Controller ---
+    # We will start with a flat Lead, Lag, and a non-active Notch
+    initial_params = [
+        Kp_pi, Ki_pi, 0.0, 0.05,  # Kp, Ki, Kd, Tf
+        10.0, 10.1,               # z_lead, p_lead (very close = almost flat)
+        10.1, 10.0,               # z_lag, p_lag (very close = almost flat)
+        200.0, 10.0              # w0_notch, Q_notch (High Q, may not be near resonance)
+    ]
+    initial_controller = ComplexController(initial_params, dt)
     
     # This is (y_0, u_0)
     y_0, u_0, r_0 = run_simulation(initial_controller, r, t, noise_std_dev, dt)
@@ -548,7 +724,8 @@ def main():
     N_iterations = 1 # Let's do 5 iterations to see clear convergence
     
     # Initialize the parameters and simulation data for the loop
-    current_pid_params = [Kp_init, Ki_init, Kd_init, Tf_init]
+    # current_params = [Kp_init, Ki_init, Kd_init, Tf_init]
+    current_params = initial_params
     sim_y = y_0
     sim_u = u_0
 
@@ -562,9 +739,9 @@ def main():
         # We state that each parameter must be at least its initial value.
         # We set the upper bound to None (or a very large number) for infinity.
         # param_bounds = [
-        #     (current_pid_params[0], None),  # Kp must be >= Kp_init
-        #     (current_pid_params[1], None),  # Ki must be >= Ki_init
-        #     (current_pid_params[2], None),  # Kd must be >= Kd_init
+        #     (current_params[0], None),  # Kp must be >= Kp_init
+        #     (current_params[1], None),  # Ki must be >= Ki_init
+        #     (current_params[2], None),  # Kd must be >= Kd_init
         #     (0.001, None)   # Tf must be >= Tf_init (or you could give it a small lower bound like 0.001)
         # ]
         # param_bounds = [
@@ -575,24 +752,32 @@ def main():
         # ]
         param_bounds = None
         # print(f"Using Bounds: {param_bounds}")
-        # new_pid_params, cost = optimize_controller(
-        #     cost_function_pid, r_f_iter, sim_y, sim_u, dt, current_pid_params
+        # new_params, cost = optimize_controller(
+        #     cost_function_pid, r_f_iter, sim_y, sim_u, dt, current_params
         # )
-        new_pid_params, cost = optimize_controller(
-            cost_function, t, sim_y, sim_u, dt, current_pid_params, bounds=param_bounds, M_tf=M_tf)
-        
-        print(f"Result (Iter {i+1}): Kp={new_pid_params[0]:.2f}, Ki={new_pid_params[1]:.2f}, Kd={new_pid_params[2]:.2f}, Tf={new_pid_params[3]:.4f}, cost={cost:.6f}")
+        # new_params, cost = optimize_controller(
+        #     cost_function, t, sim_y, sim_u, dt, current_params, bounds=param_bounds, M_tf=M_tf)
+        new_params, cost = optimize_controller(
+        cost_function_complex, t, sim_y, sim_u, dt, current_params, bounds=param_bounds, M_tf=M_tf)
+
+
+        # print(f"Result (Iter {i+1}): Kp={new_params[0]:.2f}, Ki={new_params[1]:.2f}, Kd={new_params[2]:.2f}, Tf={new_params[3]:.4f}, cost={cost:.6f}")
+        print(f"Result (Iter {i+1}): Kp={new_params[0]:.2f}, Ki={new_params[1]:.2f}, Kd={new_params[2]:.2f}, Tf={new_params[3]:.4f}, ")
+        print(f"                     z_lead={new_params[4]:.2f}, p_lead={new_params[5]:.2f}, z_lag={new_params[6]:.2f}, p_lag={new_params[7]:.4f},")
+        print(f"                     w_notch={new_params[8]:.2f}, Q_notch={new_params[9]:.2f}, cost={cost:.6f}")
 
         # Update the current parameters to the new ones we just found
-        current_pid_params = new_pid_params
+        current_params = new_params
         
         # STEP 3: Run a NEW simulation with the NEWLY optimized controller (C_{i+1})
         # to generate the dataset (y_{i+1}, u_{i+1}) for the NEXT loop.
         print("Validating new controller and generating data for next iteration...")
-        current_controller = PIDControllerWithFilter(
-            current_pid_params[0], current_pid_params[1], 
-            current_pid_params[2], current_pid_params[3], dt
-        )
+        # current_controller = PIDControllerWithFilter(
+        #     current_params[0], current_params[1], 
+        #     current_params[2], current_params[3], dt
+        # )
+        current_controller = ComplexController(current_params, dt)
+
         sim_y, sim_u, _ = run_simulation(current_controller, r, t, noise_std_dev, dt)
         
         # Plot the progress, comparing to the very first response
