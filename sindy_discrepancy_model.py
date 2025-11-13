@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.8
+#!/usr/bin/env python3
 
 
 import numpy as np
@@ -7,6 +7,8 @@ from scipy.integrate import solve_ivp
 import pysindy as ps
 from sklearn.linear_model import Lasso
 
+
+hidden_states1_discrepancy0 = 0  # what model to use
 
 def average_mutual_information(x, tau, n_bins=32):
     """
@@ -48,25 +50,53 @@ def average_mutual_information(x, tau, n_bins=32):
 # -------------------------------
 # 1. Define and simulate the full system
 # -------------------------------
-def two_mass_system(t, z, m1, m2, k1, k2, c1, c2):
+def two_mass_system(t, z, m1, m2, k1, k2, c1, c2, f_c, f_s, v_s):
     """
-    Two-mass spring-damper system:
+    Two-mass spring-damper system with Karnopp friction:
       Mass 1: connected to ground by spring (k1) and damper (c1)
       Mass 1 and mass 2: coupled by spring-damper (k2, c2)
-    
+      Friction (Karnopp model) acts on both masses, depends only on velocity.
+
     State vector: z = [x1, v1, x2, v2]
+    Karnopp friction parameters:
+        f_c: Coulomb friction force
+        f_s: Static friction force
+        v_s: Stribeck velocity (defines stick-slip threshold)
     """
     x1, v1, x2, v2 = z
+
+    def karnopp_friction(v, f_c, f_s, v_s):
+        if np.abs(v) < v_s:
+            # Sticking regime (static friction)
+            return f_s * np.sign(v) if v != 0 else 0.0
+        else:
+            # Sliding regime (Coulomb friction)
+            return f_c * np.sign(v)
+
+    # Friction forces for each mass
+    friction1 = karnopp_friction(v1, f_c, f_s, v_s)
+    friction2 = karnopp_friction(v2, f_c, f_s, v_s)
+
     dx1dt = v1
-    dv1dt = (-k1*x1 + k2*(x2 - x1) - c1*v1) / m1
+    dv1dt = (-k1*x1 + k2*(x2 - x1) - c1*v1 - friction1) / m1
     dx2dt = v2
-    dv2dt = (-k2*(x2 - x1) - c2*v2) / m2
+    dv2dt = (-k2*(x2 - x1) - c2*v2 - friction2) / m2
     return [dx1dt, dv1dt, dx2dt, dv2dt]
 
 # System parameters
 m1, m2 = 1.0, 1.0
 k1, k2 = 2.0, 1.0
 c1, c2 = 0.1, 0.1
+if(hidden_states1_discrepancy0 == 1):
+    # No external forces
+    f_c = 0.0
+    f_s = 0.0
+    v_s = 0.0
+else:
+    # attempt to simulate a system with unknown friction
+    f_c = 0.2
+    f_s = 0.3
+    v_s = 0.01
 
 # Initial conditions: [x1, v1, x2, v2]
 z0 = [1.0, 0.0, 0.0, 0.0]
@@ -78,7 +108,7 @@ t = np.linspace(t_start, t_end, n_points)
 dt = t[1] - t[0]
 
 # Solve the ODE
-sol = solve_ivp(two_mass_system, [t_start, t_end], z0, args=(m1, m2, k1, k2, c1, c2), t_eval=t)
+sol = solve_ivp(two_mass_system, [t_start, t_end], z0, args=(m1, m2, k1, k2, c1, c2, f_c, f_s, v_s), t_eval=t)
 
 # Extract the full state (for simulation/truth) and the measurement
 x1 = sol.y[0]   # hidden
@@ -86,88 +116,123 @@ v1 = sol.y[1]   # hidden
 x2 = sol.y[2]   # measured
 v2_true = sol.y[3]  # true velocity of mass 2 (we pretend we don't measure this directly)
 
-# -------------------------------
-# 2. Pretend we only measure x2(t)
-# -------------------------------
-# In a realistic setting you might only have x2. Here we simulate that scenario.
-x2_data = x2.reshape(-1, 1)  # shape (n_samples, 1)
+if(hidden_states1_discrepancy0 == 1):
+    # -------------------------------
+    # 2. Pretend we only measure x2(t)
+    # -------------------------------
+    # In a realistic setting you might only have x2. Here we simulate that scenario.
+    x2_data = x2.reshape(-1, 1)  # shape (n_samples, 1)
 
-x2_data = x2_data #+ np.random.rand(x2_data.shape[0], 1) * 0.01  # add noise to x2
+    x2_data = x2_data + np.random.rand(x2_data.shape[0], 1) * 0.01  # add noise to x2
 
-# Compute AMI for a range of delays tau
-taus = np.arange(1, 100)  # delays from 1 to 99 time steps
-ami_values = [average_mutual_information(x2, tau, n_bins=32) for tau in taus]
+    # Compute AMI for a range of delays tau
+    taus = np.arange(1, 100)  # delays from 1 to 99 time steps
+    ami_values = [average_mutual_information(x2, tau, n_bins=32) for tau in taus]
 
-# Plot the Average Mutual Information vs. tau
-plt.figure(figsize=(8, 4))
-plt.plot(taus, ami_values, 'b.-')
-plt.xlabel('Delay (tau)')
-plt.ylabel('Average Mutual Information (nats)')
-plt.title('AMI vs. Delay')
-plt.grid(True)
-plt.show()
+    # Plot the Average Mutual Information vs. tau
+    plt.figure(figsize=(8, 4))
+    plt.plot(taus, ami_values, 'b.-')
+    plt.xlabel('Delay (tau)')
+    plt.ylabel('Average Mutual Information (nats)')
+    plt.title('AMI vs. Delay')
+    plt.grid(True)
+    plt.show()
+else:
+    # -------------------------------
+    # 2. Use the full state for comparison
+    # -------------------------------
+    x1_data = x1.reshape(-1, 1)
+    v1_data = v1.reshape(-1, 1)
+    x2_data = x2.reshape(-1, 1)
+    v2_data = v2_true.reshape(-1, 1)
 
 # -------------------------------
 # 3. Estimate derivatives from measured data
 # -------------------------------
-# We compute the first derivative (v2_est) and the second derivative (acceleration)
-# using a simple finite difference (here, np.gradient works well for our smooth data).
-v2_est = np.gradient(x2_data.squeeze(), dt)
-dv2_est = np.gradient(v2_est, dt)
+if(hidden_states1_discrepancy0 == 1):
+    # We compute the first derivative (v2_est) and the second derivative (acceleration)
+    # using a simple finite difference (here, np.gradient works well for our smooth data).
+    v2_est = np.gradient(x2_data.squeeze(), dt)
+    dv2_est = np.gradient(v2_est, dt)
+else:
+    v1_est = v1_data.squeeze()
+    dv1_est = np.gradient(v1_data.squeeze(), dt)
+    v2_est = v2_data.squeeze()
+    dv2_est = np.gradient(v2_data.squeeze(), dt)
 
 # -------------------------------
 # 4. Define a partial (incomplete) physics model for x2
 # -------------------------------
-# Suppose you know (or assume) that the second mass is only damped:
-#    m2 * x2'' = -c2 * x2'
-# Since m2 = 1, the partial model predicts:
-partial_model_acc = -c2 * v2_est / m2
+if(hidden_states1_discrepancy0 == 1):
+    # Suppose you know (or assume) that the second mass is only damped:
+    #    m2 * x2'' = -c2 * x2'
+    # Since m2 = 1, the partial model predicts:
+    partial_model_acc = -c2 * v2_est / m2
+else:
+    # we don't know about the friction terms
+    partial_model_acc1 = (-k1*x1_data + k2*(x2_data - x1_data) - c1*v1_data).squeeze() / m1
+    partial_model_acc2 = (-k2*(x2_data - x1_data) - c2*v2_data).squeeze() / m2
 
 # -------------------------------
 # 5. Compute the discrepancy between the true acceleration and the partial model
 # -------------------------------
-# The full system actually follows:
-#    x2'' = (-k2*(x2-x1) - c2*v2) / m2
-# so the discrepancy (due to the unobserved coupling with mass 1) is:
-discrepancy = dv2_est - partial_model_acc
-# (i.e., discrepancy = measured x2'' - ( -c2*v2_est ) )
+if(hidden_states1_discrepancy0 == 1):
+    # The full system actually follows:
+    #    x2'' = (-k2*(x2-x1) - c2*v2) / m2
+    # so the discrepancy (due to the unobserved coupling with mass 1) is:
+    discrepancy = dv2_est - partial_model_acc
+    # (i.e., discrepancy = measured x2'' - ( -c2*v2_est ) )
+else:
+    # For the full system, we compute the discrepancy for both masses:
+    discrepancy1 = dv1_est - partial_model_acc1
+    discrepancy2 = dv2_est - partial_model_acc2
+    # We can combine these into a single discrepancy vector:
+    discrepancy = np.hstack([discrepancy1.reshape(-1, 1), discrepancy2.reshape(-1, 1)])
 
 # -------------------------------
 # 6. Use delay embedding + SINDy to learn a model for the discrepancy
 # -------------------------------
-# The idea: even though we only measure x2, its history (or delay coordinates) can 
-# help us recover the effect of the hidden states.
-#
-# We will create an augmented (delay embedded) state of x2. For example, we choose
-# an embedding with delays corresponding to [x2(t), x2(t - τ), x2(t - 2τ)].
-tau = 43  # delay in number of time steps (adjust as needed)
-delays = [0, tau, 2*tau, 3*tau]  # delays in indices
+if(hidden_states1_discrepancy0 == 1):
+    # The idea: even though we only measure x2, its history (or delay coordinates) can 
+    # help us recover the effect of the hidden states.
+    #
+    # We will create an augmented (delay embedded) state of x2. For example, we choose
+    # an embedding with delays corresponding to [x2(t), x2(t - τ), x2(t - 2τ)].
+    tau = 43  # delay in number of time steps (adjust as needed)
+    delays = [0, tau, 2*tau, 3*tau]  # delays in indices
 
-def delay_embed(data, delays):
-    """
-    Create a delay-embedded version of the data.
-    data: 2D array of shape (n_samples, n_features)
-    delays: list of integer delays (in number of samples)
-    Returns an array of shape (n_samples - max(delays), n_features * len(delays))
-    """
-    n_samples = data.shape[0]
+    def delay_embed(data, delays):
+        """
+        Create a delay-embedded version of the data.
+        data: 2D array of shape (n_samples, n_features)
+        delays: list of integer delays (in number of samples)
+        Returns an array of shape (n_samples - max(delays), n_features * len(delays))
+        """
+        n_samples = data.shape[0]
+        max_delay = max(delays)
+        embed_list = []
+        for d in delays:
+            embed_list.append(data[d:n_samples - max_delay + d])
+        return np.hstack(embed_list)
+
+    # Create the delay-embedded feature matrix from x2_data.
+    X_embedded = delay_embed(x2_data, delays)
+    # Align the discrepancy target: we discard the first max(delays) samples.
     max_delay = max(delays)
-    embed_list = []
-    for d in delays:
-        embed_list.append(data[d:n_samples - max_delay + d])
-    return np.hstack(embed_list)
-
-# Create the delay-embedded feature matrix from x2_data.
-X_embedded = delay_embed(x2_data, delays)
-# Align the discrepancy target: we discard the first max(delays) samples.
-max_delay = max(delays)
-d_target = discrepancy[max_delay:]
+    d_target = discrepancy[max_delay:]
+else:
+    X_embedded = np.hstack([x1_data, v1_data, x2_data, v2_data])
+    d_target = discrepancy
 
 # -------------------------------
 # 7. Build a candidate function library and perform sparse regression
 # -------------------------------
-# We use a polynomial library (up to degree 3) from PySINDy.
-library = ps.PolynomialLibrary(degree=1)
+if(hidden_states1_discrepancy0 == 1):
+    # We use a polynomial library (up to degree 3) from PySINDy.
+    library = ps.PolynomialLibrary(degree=1)
+else:
+    library = ps.PolynomialLibrary(degree=2)
+
 Theta = library.fit_transform(X_embedded)
 
 # Use a sparse regression method (here, Lasso) to find coefficients xi in:
@@ -181,14 +246,24 @@ xi = lasso.coef_
 feature_names = library.get_feature_names()
 
 print("Learned model for the discrepancy (nonzero terms):")
-for coef, name in zip(xi, feature_names):
-    if np.abs(coef) > 1e-5:
-        print(f"  {name:20s} : {coef: .5f}")
+if(hidden_states1_discrepancy0 == 1):
+    for coef, name in zip(xi, feature_names):
+        if np.abs(coef) > 1e-5:
+            print(f"  {name:20s} : {coef: .5f}")
+else:
+    for i, Xi in enumerate(xi):
+        print(f"  equation {i:1d}:")
+        for coef, name in zip(Xi, feature_names):
+            if np.abs(coef) > 5e-2:
+                print(f"  {name:20s} : {coef: .5f}")
 
 # -------------------------------
 # 8. Compare the learned discrepancy model with the true discrepancy
 # -------------------------------
-d_pred = Theta @ xi
+if(hidden_states1_discrepancy0 == 1):
+    d_pred = Theta @ xi
+else:
+    d_pred = Theta @ xi.reshape(-1,2)
 
 plt.figure(figsize=(10, 4))
 plt.plot(t[max_delay:], d_target, 'k', label='True discrepancy')
@@ -368,4 +443,4 @@ plt.ylabel('x2 (position)')
 plt.title('Full Simulation vs. Hybrid (Physics-Informed) Model no delays')
 plt.legend()
 plt.tight_layout()
-plt.show()
+plt.show(block=True)
