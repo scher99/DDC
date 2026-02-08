@@ -14,6 +14,44 @@ import torch.nn as nn
 import torch.optim as optim
 from torchdiffeq import odeint
 
+# --- Shared SINDy library definition ---
+
+FEATURE_NAMES = [
+    # '1', # Bias term (constant)
+    'x_l',
+    'v_l',
+    'u',
+    'sgn(v_l)',
+    # 'sin(x_l)',
+    # 'v_l|v_l|'
+]
+
+def build_library_numpy(xl, vl, u):
+    """
+    Constructs the library matrix Theta for NumPy arrays.
+    """
+    return np.column_stack([
+        # np.ones_like(xl),       # 0: Bias
+        xl,                     # 1: Load Pos
+        vl,                     # 2: Load Vel
+        u,                      # 3: Input
+        np.sign(vl),            # 4: Coulomb Load
+        # np.sin(xl),             # 5: Gravity (Sin)
+        # vl * np.abs(vl)         # 6: Quadratic Drag
+    ])
+
+def build_library_torch(xl, vl, u):
+    """
+    Constructs the library matrix Theta for Torch tensors.
+    """
+    return torch.cat([
+        # torch.ones_like(xl),
+        xl, vl, u,
+        torch.tanh(100 * vl),   # Smooth sign
+        # torch.sin(xl),
+        # vl * torch.abs(vl)
+    ], dim=1)
+
 def plot_raw_data(data):
     """
     Quick sanity plots for loaded text-file data.
@@ -74,6 +112,21 @@ def plot_raw_data(data):
     plt.tight_layout()
     plt.show(block=True)
 
+def plot_accelerations(acc_measured, acc_computed, t=None, title="Acceleration Comparison"):
+    """
+    Plot measured vs computed accelerations.
+    """
+    plt.figure(figsize=(10, 4))
+
+    plt.plot(t, acc_measured, label="Measured Accel", alpha=0.7)
+    plt.plot(t, acc_computed, label="Computed Accel", alpha=0.7)
+    plt.xlabel("t [Sec]")
+    plt.ylabel("Acceleration (rad/s^2)")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.show(block=True)
+
 # --- 1. Data Loading and Preprocessing ---
 def load_data(filepath):
     if not os.path.exists(filepath):
@@ -106,6 +159,9 @@ def load_data(filepath):
         # commands
         "wy_cmd":   data["pitchrate_cmds"],
         "wz_cmd":   data["yawrate_cmds"],
+        # accelerations (not used directly, but could be for validation)
+        "acc_pitch": data["acc_pitch"], 
+        "acc_yaw":   data["acc_yaw"]
     }
 
 def preprocess_data(data, dt=0.01, N=-1):
@@ -143,6 +199,7 @@ def preprocess_data(data, dt=0.01, N=-1):
         'X': X_yaw[N:],
         'u': u[N:],
         'cmd': data['wz_cmd'][N:],
+        'acc': data['acc_yaw'][N:],
         'dt': dt
     }
 
@@ -161,6 +218,7 @@ def preprocess_data(data, dt=0.01, N=-1):
         'X': X_pitch[:N],
         'u': u[:N],
         'cmd': data['wy_cmd'][:N],
+        'acc': data['acc_pitch'][:N],
         'dt': dt
     }
 
@@ -179,7 +237,7 @@ def calculate_derivatives(X, dt):
     
     # Numerical derivatives for velocities (Accelerations)
     # Savitzky-Golay filter for smooth differentiation
-    X_dot[:, 1] = savgol_filter(X[:, 1], window_length=11, polyorder=3, deriv=1, delta=dt)
+    X_dot[:, 1] = savgol_filter(X[:, 1], window_length=5, polyorder=4, deriv=1, delta=dt)
     
     return X_dot
 
@@ -191,9 +249,8 @@ class SINDy1DGimbal:
         # A smaller alpha (e.g. 0.001) is often needed compared to a hard threshold (0.01).
         self.threshold = threshold
         self.coefs = None
-        # Features: [1, xl, vl, u, sign(vl), sin(xl), cos(xl), v_l|vl|]
-        self.feature_names = ['1', 'x_l', 'v_l', 'u', 
-                              'sgn(v_l)', 'sin(x_l)', 'v_l|v_l|']
+        # Features: [1, xl, vl, u, sign(vl), sin(xl), v_l|vl|]
+        self.feature_names = FEATURE_NAMES
 
     def build_library(self, X, u):
         """
@@ -202,17 +259,8 @@ class SINDy1DGimbal:
         """
         xl = X[:, 0]
         vl = X[:, 1]
-        
-        Theta = np.column_stack([
-            np.ones_like(xl),       # 0: Bias
-            xl,                     # 1: Load Pos
-            vl,                     # 2: Load Vel
-            u,                      # 3: Input
-            np.sign(vl),            # 4: Coulomb Load
-            np.sin(xl),             # 5: Gravity (Sin)
-            vl * np.abs(vl)         # 6: Quadratic Drag
-        ])
-        return Theta
+
+        return build_library_numpy(xl, vl, u)
 
     def fit(self, X, X_dot, u):
         """
@@ -310,6 +358,7 @@ def validate_model_response(sindy_model, t, X_true, u_true):
         
     plt.suptitle(f"SINDy Model Verification (open-loop) vs Real Data", fontsize=16)
     plt.tight_layout()
+    plt.show(block=True)
     # plt.savefig('sindy_verification.png')
     print("Verification plot generated.")
 
@@ -330,16 +379,9 @@ class DifferentiablePlant(nn.Module):
         """
         xl = x[:, 0:1]
         vl = x[:, 1:2]
-        
+
         # Matches build_library structure
-        # [1, xm, vm, xl, vl, u, sgn(vl), sin(xl), vl|vl|]
-        Theta = torch.cat([
-            torch.ones_like(xl),
-            xl, vl, u,
-            torch.tanh(100*vl), # Smooth sign
-            torch.sin(xl),
-            vl * torch.abs(vl)
-        ], dim=1)
+        Theta = build_library_torch(xl, vl, u)
         
         # Compute Accelerations: Theta * W
         accs = torch.matmul(Theta, self.W)
@@ -354,13 +396,30 @@ class DifferentiablePlant(nn.Module):
 class PIDController(nn.Module):
     def __init__(self, kp=1.0, ki=0.1, kd=0.5):
         super().__init__()
+
+        def softplus_inv(x):
+            x = torch.as_tensor(x, dtype=torch.float64)
+            x = torch.clamp(x, min=1e-8)  # prevent underflow to zero
+            # stable inverse: piecewise
+            thresh = 20.0
+            small = x < thresh
+            out = torch.empty_like(x)
+            out[small] = torch.log(torch.expm1(x[small]))
+            out[~small] = x[~small] + torch.log1p(-torch.exp(-x[~small]))
+            return out.to(dtype=torch.float32)
+
+
         # Initialize gains
-        self.raw_Kp = nn.Parameter(torch.tensor(kp))
-        self.raw_Ki = nn.Parameter(torch.tensor(ki))
-        self.raw_Kd = nn.Parameter(torch.tensor(kd))
+        self.raw_Kp = nn.Parameter(softplus_inv(kp))
+        self.raw_Ki = nn.Parameter(softplus_inv(ki))
+        self.raw_Kd = nn.Parameter(softplus_inv(kd))
         
     def get_gains(self):
-        return self.raw_Kp, self.raw_Ki, self.raw_Kd
+        # enforce positivity of gains using softplus
+        Kp = torch.nn.functional.softplus(self.raw_Kp)
+        Ki = torch.nn.functional.softplus(self.raw_Ki)
+        Kd = torch.nn.functional.softplus(self.raw_Kd)
+        return Kp, Ki, Kd
 
     def forward(self, error, integral_error, velocity):
         Kp, Ki, Kd = self.get_gains()
@@ -403,13 +462,18 @@ class ClosedLoopSystem(nn.Module):
 def train_controller(plant_model, epochs=100):
     print("\n--- Optimizing PID Controller using Differential Programming ---")
     
-    Kt = 0.0150 # Motor torque constant (Nm/A)
+    Kt = 0.0150 #*0.5# Motor torque constant (Nm/A)
     # these are starting points based on manual tuning (simulink) multiplied by Kt
     # because we get the torque in the recordings, not the current like in simulink
+    init_controller = PIDController(kp=180.0*Kt, ki=40000.0*Kt, kd=0.04*Kt)
     controller = PIDController(kp=180.0*Kt, ki=40000.0*Kt, kd=0.04*Kt)
     # controller = PIDController(kp=10.0, ki=0.0, kd=0.0)
-    t_eval = torch.linspace(0, 4, int(0.5*1200))
-    cmd_eval = torch.tensor([1.0 if t > 0.1 else 0.0 for t in t_eval])
+    t_eval = torch.linspace(0, 4, int(1200))
+    # cmd_eval = torch.tensor([1.0 if t > 0.1 else 0.0 for t in t_eval])
+    # piecewise-constant command, change every 1 second
+    cmd_values = torch.tensor([0.0, 1.0, -0.5, 0.75, 0.0], dtype=torch.float32)  # len = 5 for 0..4s
+    idx = torch.clamp((t_eval // 1.0).long(), max=cmd_values.numel() - 1)
+    cmd_eval = cmd_values[idx]
 
     system = ClosedLoopSystem(plant_model, controller, 
                               cmd=cmd_eval,
@@ -417,7 +481,8 @@ def train_controller(plant_model, epochs=100):
     
     optimizer = optim.Adam(controller.parameters(), lr=0.05)
     
-    
+    prev_loss = None
+    rel_tol = 1e-4  # relative improvement threshold
     for epoch in range(epochs):
         optimizer.zero_grad()
         
@@ -437,12 +502,19 @@ def train_controller(plant_model, epochs=100):
         
         loss.backward()
         optimizer.step()
+
+        if prev_loss is not None:
+            rel_improve = (prev_loss - loss.item()) / max(prev_loss, 1e-12)
+            if rel_improve < rel_tol:
+                print(f"Early stop: rel_improve={rel_improve:.2e}")
+                break
+        prev_loss = loss.item()
         
         if epoch % 10 == 0:
             kp, ki, kd = controller.get_gains()
-            print(f"Epoch {epoch}: Loss={loss.item():.3e} | Kp={kp.item():.2f}, Ki={ki.item():.2f}, Kd={kd.item():.2f}")
+            print(f"Epoch {epoch}: Loss={loss.item():.3e} | Kp={kp.item():.2f}, Ki={ki.item():.2f}, Kd={kd.item():.3f}")
             
-    return controller
+    return controller, init_controller
 
 
 def discover_dynamics(data, X_dot):
@@ -458,12 +530,12 @@ def discover_dynamics(data, X_dot):
 
 def optimize_controller(sindy_coefs):
     plant_torch = DifferentiablePlant(sindy_coefs)
-    best_controller = train_controller(plant_torch)
+    best_controller, init_controller = train_controller(plant_torch)
     
     Kp, Ki, Kd = best_controller.get_gains()
     print(f"\nFINAL RESULT:\nOptimal PID Gains: Kp={Kp.item():.4f}, Ki={Ki.item():.4f}, Kd={Kd.item():.4f}")
     
-    return best_controller, plant_torch
+    return best_controller, plant_torch, init_controller
 
 # --- Main Execution ---
 
@@ -482,11 +554,15 @@ if __name__ == "__main__":
     yaw_data, pitch_data = preprocess_data(data, N=int(N/2)) # t, X, u, dt
     X_yaw_dot   = calculate_derivatives(yaw_data['X'], yaw_data['dt'])
     X_pitch_dot = calculate_derivatives(pitch_data['X'], pitch_data['dt'])
+
+    plot_accelerations(yaw_data['acc'], X_yaw_dot[:, 1], t=yaw_data['t'], title="Yaw Acceleration Comparison")
     
     # 3. Discover Dynamics (SINDy with Lasso)
     print("Discovering Dynamics for Yaw...")
     sindy_coefs_yaw = discover_dynamics(yaw_data, X_yaw_dot)
-    best_controller_yaw, plant_torch_yaw = optimize_controller(sindy_coefs_yaw)
+    # X_dot = np.column_stack([X_yaw_dot[:, 0], yaw_data['acc']]) # only for validation, not for fitting
+    # sindy_coefs_yaw = discover_dynamics(yaw_data, X_dot) # only for validation, not for fitting
+    best_controller_yaw, plant_torch_yaw, init_controller_yaw = optimize_controller(sindy_coefs_yaw)
     
     # 5. Visualize Result
     system_yaw = ClosedLoopSystem(plant_torch_yaw, best_controller_yaw, 
@@ -496,8 +572,14 @@ if __name__ == "__main__":
     with torch.no_grad():
         traj_yaw = odeint(system_yaw, torch.zeros(3), t_sim)
     
+    system_yaw_init = ClosedLoopSystem(plant_torch_yaw, init_controller_yaw, 
+                                  cmd=yaw_data['cmd'], t_vec=yaw_data['t'])
+    with torch.no_grad():
+        traj_yaw_init = odeint(system_yaw_init, torch.zeros(3), t_sim)
+    
     plt.figure()
     plt.plot(t_sim, traj_yaw[:, 1], label="Rate (Simulated)")
+    plt.plot(t_sim, traj_yaw_init[:, 1], label="Rate (Initial)")
     plt.plot(yaw_data["t"], yaw_data['X'][:, 1], label="Rate (measured)", alpha=0.6)
     # plt.plot(t_sim, [1.0 if t>0.1 else 0.0 for t in t_sim], 'k--', label="Target")
     plt.title("Optimized Controller Response (Yaw)")
@@ -509,7 +591,7 @@ if __name__ == "__main__":
 
     # print("Discovering Dynamics for Pitch...")
     # sindy_coefs_pitch = discover_dynamics(pitch_data, X_pitch_dot)
-    # best_controller_pitch, plant_torch_pitch = optimize_controller(sindy_coefs_pitch)
+    # best_controller_pitch, plant_torch_pitch, init_controller_pitch = optimize_controller(sindy_coefs_pitch)
 
     # system_pitch = ClosedLoopSystem(plant_torch_pitch, best_controller_pitch, cmd=pitch_data['cmd'], t_vec=pitch_data['t'])
     # t_sim = torch.tensor(pitch_data["t"], dtype=torch.float32)
