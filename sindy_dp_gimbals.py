@@ -459,7 +459,7 @@ class ClosedLoopSystem(nn.Module):
         
         return torch.cat([dx_sys.squeeze(0), d_int_err])
 
-def train_controller(plant_model, epochs=100):
+def train_controller(plant_model, cmd_eval, t_eval, epochs=100):
     print("\n--- Optimizing PID Controller using Differential Programming ---")
     
     Kt = 0.0150 #*0.5# Motor torque constant (Nm/A)
@@ -467,13 +467,20 @@ def train_controller(plant_model, epochs=100):
     # because we get the torque in the recordings, not the current like in simulink
     init_controller = PIDController(kp=180.0*Kt, ki=40000.0*Kt, kd=0.04*Kt)
     controller = PIDController(kp=180.0*Kt, ki=40000.0*Kt, kd=0.04*Kt)
+    # 1)
     # controller = PIDController(kp=10.0, ki=0.0, kd=0.0)
-    t_eval = torch.linspace(0, 4, int(1200))
+    # 2)
+    # t_eval = torch.linspace(0, 4, int(1200))
     # cmd_eval = torch.tensor([1.0 if t > 0.1 else 0.0 for t in t_eval])
     # piecewise-constant command, change every 1 second
-    cmd_values = torch.tensor([0.0, 1.0, -0.5, 0.75, 0.0], dtype=torch.float32)  # len = 5 for 0..4s
-    idx = torch.clamp((t_eval // 1.0).long(), max=cmd_values.numel() - 1)
-    cmd_eval = cmd_values[idx]
+    # cmd_values = torch.tensor([0.0, 1.0, -0.5, 0.75, 0.0], dtype=torch.float32)  # len = 5 for 0..4s
+    # idx = torch.clamp((t_eval // 1.0).long(), max=cmd_values.numel() - 1)
+    # cmd_eval = cmd_values[idx]
+    # 3)
+    # use provided cmd/time
+    cmd_eval = torch.as_tensor(cmd_eval, dtype=torch.float32)
+    t_eval = torch.as_tensor(t_eval, dtype=torch.float32)
+
 
     system = ClosedLoopSystem(plant_model, controller, 
                               cmd=cmd_eval,
@@ -482,7 +489,7 @@ def train_controller(plant_model, epochs=100):
     optimizer = optim.Adam(controller.parameters(), lr=0.05)
     
     prev_loss = None
-    rel_tol = 1e-4  # relative improvement threshold
+    rel_tol = 1e-5  # relative improvement threshold
     for epoch in range(epochs):
         optimizer.zero_grad()
         
@@ -505,7 +512,7 @@ def train_controller(plant_model, epochs=100):
 
         if prev_loss is not None:
             rel_improve = (prev_loss - loss.item()) / max(prev_loss, 1e-12)
-            if rel_improve < rel_tol:
+            if np.abs(rel_improve) < rel_tol:
                 print(f"Early stop: rel_improve={rel_improve:.2e}")
                 break
         prev_loss = loss.item()
@@ -524,13 +531,16 @@ def discover_dynamics(data, X_dot):
     sindy_coefs = plant.fit(data['X'], X_dot, data['u'])
     plant.print_equations()
 
+    # print('using default coefficients for validation')
+    # plant.coefs = np.array([[-925], [-15.0], [500.0], [-2.5]])
+
     validate_model_response(plant, data['t'], data['X'], data['u']) # Plot verification
     
     return sindy_coefs
 
-def optimize_controller(sindy_coefs):
+def optimize_controller(sindy_coefs, cmd_eval, t_eval):
     plant_torch = DifferentiablePlant(sindy_coefs)
-    best_controller, init_controller = train_controller(plant_torch)
+    best_controller, init_controller = train_controller(plant_torch, cmd_eval, t_eval)
     
     Kp, Ki, Kd = best_controller.get_gains()
     print(f"\nFINAL RESULT:\nOptimal PID Gains: Kp={Kp.item():.4f}, Ki={Ki.item():.4f}, Kd={Kd.item():.4f}")
@@ -543,7 +553,7 @@ if __name__ == "__main__":
     # 1. Load Data
     # filepath = "PedTelem_20230722092156.pkl" 
     # filepath = "PedTelem_20230629012751.pkl" 
-    filepath = "pitch_then_yaw_rate_cmds.txt" 
+    filepath = "pitch_then_yaw_rate_cmds_wo_noise.txt" 
     
     data = load_data(filepath)
     plot_raw_data(data)
@@ -559,10 +569,14 @@ if __name__ == "__main__":
     
     # 3. Discover Dynamics (SINDy with Lasso)
     print("Discovering Dynamics for Yaw...")
+    print('using derived accelerations for fitting')
     sindy_coefs_yaw = discover_dynamics(yaw_data, X_yaw_dot)
+    # print('using measured accelerations for fitting')
     # X_dot = np.column_stack([X_yaw_dot[:, 0], yaw_data['acc']]) # only for validation, not for fitting
     # sindy_coefs_yaw = discover_dynamics(yaw_data, X_dot) # only for validation, not for fitting
-    best_controller_yaw, plant_torch_yaw, init_controller_yaw = optimize_controller(sindy_coefs_yaw)
+    best_controller_yaw, plant_torch_yaw, init_controller_yaw = \
+                                                optimize_controller(sindy_coefs_yaw,
+                                                                    yaw_data["cmd"], yaw_data["t"])
     
     # 5. Visualize Result
     system_yaw = ClosedLoopSystem(plant_torch_yaw, best_controller_yaw, 
@@ -578,6 +592,7 @@ if __name__ == "__main__":
         traj_yaw_init = odeint(system_yaw_init, torch.zeros(3), t_sim)
     
     plt.figure()
+    plt.plot(yaw_data["t"], yaw_data['cmd'], label="Cmd")
     plt.plot(t_sim, traj_yaw[:, 1], label="Rate (Simulated)")
     plt.plot(t_sim, traj_yaw_init[:, 1], label="Rate (Initial)")
     plt.plot(yaw_data["t"], yaw_data['X'][:, 1], label="Rate (measured)", alpha=0.6)
@@ -591,7 +606,7 @@ if __name__ == "__main__":
 
     # print("Discovering Dynamics for Pitch...")
     # sindy_coefs_pitch = discover_dynamics(pitch_data, X_pitch_dot)
-    # best_controller_pitch, plant_torch_pitch, init_controller_pitch = optimize_controller(sindy_coefs_pitch)
+    # best_controller_pitch, plant_torch_pitch, init_controller_pitch = optimize_controller(sindy_coefs_pitch, pitch_data["cmd"], pitch_data["t"])
 
     # system_pitch = ClosedLoopSystem(plant_torch_pitch, best_controller_pitch, cmd=pitch_data['cmd'], t_vec=pitch_data['t'])
     # t_sim = torch.tensor(pitch_data["t"], dtype=torch.float32)
